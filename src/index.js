@@ -2,37 +2,49 @@ const mongoose = require("mongoose");
 const app = require("./app");
 const config = require("./config/config");
 const logger = require("./config/logger");
+const { redis } = require("./config/redis");
 const queueManager = require("./utils/podioQueueManager");
 
 let server;
 logger.info(`Node Environment => ${config.NODE_ENV}`);
 
-// Connect to MongoDB using mongoose
+// Connect to MongoDB and Redis, then start
 mongoose.connect(config.MONGODB_URL).then(async () => {
   logger.info(`Connected to MongoDB => ${config.MONGODB_URL}`);
 
   // Recover any pending queue items from DB
   await queueManager.init();
 
+  // Start BullMQ workers (flush + batch)
+  queueManager.startWorkers();
+
   server = app.listen(config.PORT, () => {
     logger.info(`Node server listening on port => ${config.PORT}`);
+    logger.info(
+      `Bull Board UI => http://localhost:${config.PORT}/admin/queues`,
+    );
+    logger.info(
+      `App Registry => http://localhost:${config.PORT}/admin/apps`,
+    );
   });
 });
 
-// Graceful shutdown: persist queue state → close server → disconnect DB → exit
+// Graceful shutdown: close workers → close server → disconnect Redis + MongoDB → exit
 const gracefulShutdown = async (signal) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
-  // Persist any pending queue items before shutting down
-  await queueManager.persistState();
+  // Close BullMQ workers and persist staging Map
+  await queueManager.shutdown();
 
   if (server) {
     server.close(async () => {
       try {
+        await redis.quit();
+        logger.info("Disconnected from Redis");
         await mongoose.disconnect();
         logger.info("Disconnected from MongoDB");
       } catch (err) {
-        logger.error("Error disconnecting from MongoDB", err);
+        logger.error("Error during disconnect:", err.message);
       }
       logger.info("Server closed");
       process.exit(0);

@@ -2,78 +2,97 @@ const axios = require("axios");
 const config = require("./config");
 const logger = require("./logger");
 
+/**
+ * Multi-app Podio Auth Manager.
+ * Maintains a token cache keyed by appId.
+ * Each app authenticates independently using its own appToken
+ * + shared clientId/clientSecret from env.
+ */
 class PodioAuthManager {
   constructor() {
-    this.accessToken = null;
-    this.refreshToken = null;
-    this.expiresAt = null;
+    // Map<appId, { accessToken, refreshToken, expiresAt }>
+    this.tokenCache = new Map();
   }
 
   /**
-   * Returns a valid access token, refreshing if expired.
+   * Returns a valid access token for the given app.
+   * @param {string|number} appId
+   * @param {string} appToken
    */
-  async getAccessToken() {
-    if (this._isValid()) return this.accessToken;
-    if (this.refreshToken) return this._refresh();
-    return this._authenticate();
+  async getAccessToken(appId, appToken) {
+    const key = String(appId);
+    const cached = this.tokenCache.get(key);
+
+    if (cached && this._isValid(cached)) {
+      return cached.accessToken;
+    }
+
+    if (cached?.refreshToken) {
+      return this._refresh(key, cached.refreshToken);
+    }
+
+    return this._authenticate(key, appToken);
   }
 
-  _isValid() {
-    return this.accessToken && Date.now() < this.expiresAt - 60_000;
+  _isValid(cached) {
+    return cached.accessToken && Date.now() < cached.expiresAt - 60_000;
   }
 
   /**
-   * Initial app authentication
-   * POST /oauth/token/v2 with grant_type=app
+   * Authenticate with Podio using app credentials.
    */
-  async _authenticate() {
-    logger.info("[Auth] Authenticating with Podio App credentials...");
+  async _authenticate(appId, appToken) {
+    logger.info(`[Auth] Authenticating app ${appId}...`);
     const { data } = await axios.post(
       "https://api.podio.com/oauth/token/v2",
       {
         grant_type: "app",
-        app_id: config.PODIO_APP_ID,
-        app_token: config.PODIO_APP_TOKEN,
+        app_id: appId,
+        app_token: appToken,
         client_id: config.PODIO_CLIENT_ID,
         client_secret: config.PODIO_CLIENT_SECRET,
       },
       { headers: { "Content-Type": "application/json" } },
     );
-    this._store(data);
-    logger.info(`[Auth] Authenticated. Token expires in ${data.expires_in}s`);
-    return this.accessToken;
+    this._store(appId, data);
+    logger.info(`[Auth] App ${appId} authenticated. Expires in ${data.expires_in}s`);
+    return data.access_token;
   }
 
   /**
-   * Refresh using refresh_token
+   * Refresh token for an app.
    */
-  async _refresh() {
-    logger.info("[Auth] Refreshing Podio access token...");
+  async _refresh(appId, refreshToken) {
+    logger.info(`[Auth] Refreshing token for app ${appId}...`);
     try {
       const { data } = await axios.post(
         "https://api.podio.com/oauth/token/v2",
         {
           grant_type: "refresh_token",
-          refresh_token: this.refreshToken,
+          refresh_token: refreshToken,
           client_id: config.PODIO_CLIENT_ID,
           client_secret: config.PODIO_CLIENT_SECRET,
         },
         { headers: { "Content-Type": "application/json" } },
       );
-      this._store(data);
-      logger.info("[Auth] Token refreshed successfully.");
-      return this.accessToken;
+      this._store(appId, data);
+      logger.info(`[Auth] App ${appId} token refreshed.`);
+      return data.access_token;
     } catch (err) {
-      logger.warn("[Auth] Refresh failed, re-authenticating...");
-      this.refreshToken = null;
-      return this._authenticate();
+      logger.warn(`[Auth] Refresh failed for app ${appId}, re-authenticating...`);
+      const cached = this.tokenCache.get(String(appId));
+      this.tokenCache.delete(String(appId));
+      // Need appToken to re-auth — caller must handle if not available
+      throw new Error(`Token refresh failed for app ${appId}. Re-authentication required.`);
     }
   }
 
-  _store(data) {
-    this.accessToken = data.access_token;
-    this.refreshToken = data.refresh_token;
-    this.expiresAt = Date.now() + data.expires_in * 1000;
+  _store(appId, data) {
+    this.tokenCache.set(String(appId), {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      expiresAt: Date.now() + data.expires_in * 1000,
+    });
   }
 }
 

@@ -1,31 +1,25 @@
-const Bottleneck = require("bottleneck");
+const { Worker, UnrecoverableError } = require("bullmq");
 const WebhookState = require("../db/webhook-state.model");
 const PodioItem = require("../db/podio-item.model");
 const podioClient = require("../webhooks/client");
 const transformPodioItem = require("./transformPodioItem");
+const { flushQueue, batchQueue } = require("../queues");
+const config = require("../config/config");
 const logger = require("../config/logger");
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 500;
-const FLUSH_INTERVAL = parseInt(process.env.FLUSH_INTERVAL_MS) || 120_000;
+const FLUSH_DELAY = parseInt(process.env.FLUSH_DELAY_MS) || 120_000;
 const HEARTBEAT_INTERVAL = 10 * 60 * 1000;
-const MAX_RETRIES = 3;
 
 class PodioQueueManager {
   constructor() {
     if (PodioQueueManager.instance) return PodioQueueManager.instance;
 
-    // Map<appId, Set<itemId>> — Set for O(1) dedup
+    // Map<appId, Set<itemId>> — staging area, same as before
     this.appMap = new Map();
-
-    // Bottleneck governs flush calls — respects 250/hr filter limit
-    // 14.4s between calls = ~4/min = ~240/hr (10 call buffer under limit)
-    this.limiter = new Bottleneck({
-      minTime: FLUSH_INTERVAL,
-      maxConcurrent: 1,
-    });
-
-    this._startFlushLoop();
-    this._startHeartbeat();
+    this.flushWorker = null;
+    this.batchWorker = null;
+    this.heartbeatTimer = null;
 
     PodioQueueManager.instance = this;
     return this;
@@ -33,13 +27,48 @@ class PodioQueueManager {
 
   /**
    * Add an item to the pending set for its app.
-   * Set dedup means enqueueing the same item 100 times = stored once.
+   * Then schedule a delayed BullMQ flush trigger for that app.
+   * BullMQ dedup via jobId: only one flush trigger per app at a time.
    */
-  enqueue(appId, itemId) {
+  async enqueue(appId, itemId) {
     const key = String(appId);
     if (!this.appMap.has(key)) this.appMap.set(key, new Set());
     this.appMap.get(key).add(String(itemId));
     logger.debug(`[Queue] Enqueued item ${itemId} for app ${appId}`);
+
+    await this._scheduleFlush(key);
+  }
+
+  /**
+   * Schedule a delayed flush trigger for an app.
+   * Uses a unique jobId per scheduling so BullMQ doesn't skip it
+   * due to a completed/failed job with the same ID from a previous run.
+   */
+  async _scheduleFlush(appId) {
+    const jobId = `flush-${appId}-${Date.now()}`;
+    // Remove any existing delayed flush for this app before adding a new one
+    const delayed = await flushQueue.getDelayed();
+    for (const job of delayed) {
+      if (job.data.appId === appId) {
+        await job.remove();
+      }
+    }
+    await flushQueue.add(
+      "flush",
+      { appId },
+      { jobId, delay: FLUSH_DELAY },
+    );
+    logger.debug(`[Queue] Flush scheduled for app ${appId} in ${FLUSH_DELAY}ms`);
+  }
+
+  /**
+   * Start BullMQ workers. Called after MongoDB is connected.
+   */
+  startWorkers() {
+    this._startFlushWorker();
+    this._startBatchWorker();
+    this._startHeartbeat();
+    logger.info("[Queue] Workers started");
   }
 
   /**
@@ -53,63 +82,107 @@ class PodioQueueManager {
       for (const state of states) {
         const key = String(state.appId);
         if (!this.appMap.has(key)) this.appMap.set(key, new Set());
-        state.pendingItems.forEach((i) => {
+        for (const i of state.pendingItems) {
           this.appMap.get(key).add(String(i.itemId));
           recovered++;
-        });
+        }
+        // Schedule flush for recovered items
+        if (state.pendingItems.length > 0) {
+          await this._scheduleFlush(key);
+        }
       }
       logger.info(`[Queue] Recovered ${recovered} pending items from DB`);
     } catch (err) {
-      logger.error("[Queue] Recovery failed:", err.message);
+      logger.error(`[Queue] Recovery failed: ${err.message}`);
     }
   }
 
   /**
-   * Every FLUSH_INTERVAL ms, schedule a flush for each app that has pending items.
-   * The Bottleneck limiter serialises these so we never burst beyond rate limits.
+   * Flush worker — consumes flush triggers.
+   * Snapshots the staging Map for the app, clears it, pushes batch jobs.
    */
-  _startFlushLoop() {
-    setInterval(() => {
-      for (const [appId, itemSet] of this.appMap) {
-        if (itemSet.size === 0) continue;
-        this.limiter.schedule(() => this._flushApp(appId));
-      }
-    }, FLUSH_INTERVAL);
+  _startFlushWorker() {
+    this.flushWorker = new Worker(
+      "podio-flush",
+      async (job) => {
+        const { appId } = job.data;
+        const itemSet = this.appMap.get(appId);
+        if (!itemSet || itemSet.size === 0) return;
+
+        // Snapshot + clear — new webhooks arriving during fetch go to next cycle
+        const itemIds = [...itemSet];
+        itemSet.clear();
+
+        logger.info(
+          `[Queue] Flushing ${itemIds.length} items for app ${appId}`,
+        );
+
+        // Push batch jobs (chunks of BATCH_SIZE)
+        for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
+          const batch = itemIds.slice(i, i + BATCH_SIZE);
+          await batchQueue.add("batch-fetch", {
+            appId,
+            itemIds: batch,
+          });
+        }
+      },
+      { connection: config.REDIS_URL, concurrency: 1 },
+    );
+
+    this.flushWorker.on("completed", (job) => {
+      logger.info(`[Queue] Flush job completed for app ${job?.data?.appId}`);
+    });
+
+    this.flushWorker.on("failed", (job, err) => {
+      logger.error(`[Queue] Flush job failed for ${job?.data?.appId}: ${err.message}`);
+    });
   }
 
   /**
-   * Drain all pending items for one app, in batches of BATCH_SIZE.
-   * Snapshot + clear pattern: new webhooks arriving during flush go into the next cycle.
+   * Batch worker — fetches items from Podio filter API and upserts to MongoDB.
+   * Rate limited to stay under Podio's 250/hr filter endpoint budget.
    */
-  async _flushApp(appId) {
-    const itemSet = this.appMap.get(appId);
-    if (!itemSet || itemSet.size === 0) return;
+  _startBatchWorker() {
+    this.batchWorker = new Worker(
+      "podio-batches",
+      async (job) => {
+        const { appId, itemIds } = job.data;
+        await this._fetchBatch(appId, itemIds);
+      },
+      {
+        connection: config.REDIS_URL,
+        concurrency: 1,
+        limiter: { max: 240, duration: 3_600_000 }, // 240/hr, under 250/hr limit
+      },
+    );
 
-    const itemIds = [...itemSet];
-    itemSet.clear();
+    this.batchWorker.on("completed", (job) => {
+      logger.info(`[Queue] Batch job completed for app ${job?.data?.appId}`);
+    });
 
-    logger.info(`[Queue] Flushing ${itemIds.length} items for app ${appId}`);
-
-    for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
-      const batch = itemIds.slice(i, i + BATCH_SIZE);
-      await this._fetchBatch(appId, batch);
-    }
+    this.batchWorker.on("failed", (job, err) => {
+      logger.error(
+        `[Queue] Batch job failed for app ${job?.data?.appId}: ${err.message}`,
+      );
+    });
   }
 
   /**
    * Fetch a batch of items using the filter API.
-   * POST /item/app/{app_id}/filter/ — "Rate limited" (250/hr) per Podio docs.
-   * On transient failure (5xx/network): re-enqueues with retry count.
-   * On permanent failure (4xx): logs and drops — retrying won't help.
+   * POST /item/app/{app_id}/filter/?hook=false
+   * 4xx → UnrecoverableError (no retry). 5xx → normal throw (BullMQ retries).
    */
-  async _fetchBatch(appId, itemIds, retryCount = 0) {
+  async _fetchBatch(appId, itemIds) {
     try {
-      const { data } = await podioClient.post(`/item/app/${appId}/filter/`, {
-        filters: { item_id: itemIds.map(Number) },
-        limit: BATCH_SIZE,
-        sort_by: "last_edit_on",
-        sort_desc: true,
-      });
+      const { data } = await podioClient.post(
+        `/item/app/${appId}/filter/?hook=false`,
+        {
+          filters: { item_id: itemIds.map(Number) },
+          limit: BATCH_SIZE,
+          sort_by: "last_edit_on",
+          sort_desc: true,
+        },
+      );
 
       logger.info(
         `[Queue] Fetched ${data.items?.length ?? 0}/${itemIds.length} items for app ${appId}`,
@@ -123,31 +196,20 @@ class PodioQueueManager {
       const responseData = err.response?.data;
 
       logger.error(
-        `[Queue] Batch fetch failed for app ${appId} | status=${status || "N/A"} | retry=${retryCount}/${MAX_RETRIES} | error=${err.message}`,
+        `[Queue] Batch fetch failed for app ${appId} | status=${status || "N/A"} | error=${err.message}`,
       );
       if (responseData) {
         logger.error(`[Queue] Podio response: ${JSON.stringify(responseData)}`);
       }
 
-      // 4xx = permanent error (bad request, auth, not found) — don't retry
+      // 4xx = permanent — skip retries
       if (status && status >= 400 && status < 500) {
-        logger.error(
-          `[Queue] Permanent ${status} error for app ${appId}. Dropping ${itemIds.length} items.`,
-        );
-        return;
-      }
-
-      // 5xx or network error — retry up to MAX_RETRIES
-      if (retryCount < MAX_RETRIES) {
-        logger.warn(
-          `[Queue] Transient error. Re-enqueuing ${itemIds.length} items for app ${appId} (attempt ${retryCount + 1}/${MAX_RETRIES})`,
-        );
-        itemIds.forEach((id) => this.enqueue(appId, id));
-      } else {
-        logger.error(
-          `[Queue] Max retries reached for app ${appId}. Dropping ${itemIds.length} items.`,
+        throw new UnrecoverableError(
+          `Permanent ${status} from Podio for app ${appId}. Dropping ${itemIds.length} items.`,
         );
       }
+      // 5xx/network = transient — BullMQ retries with exponential backoff
+      throw err;
     }
   }
 
@@ -163,13 +225,13 @@ class PodioQueueManager {
       });
       return {
         updateOne: {
-          filter: { item_id: transformed.item_id, app_id: transformed.app_id },
+          filter: { itemId: transformed.itemId, appId: transformed.appId },
           update: {
             $set: {
               ...transformed,
-              sync_status: "success",
-              last_synced_at: new Date(),
-              sync_error: null,
+              syncStatus: "success",
+              lastSyncedAt: new Date(),
+              syncError: null,
             },
           },
           upsert: true,
@@ -182,7 +244,7 @@ class PodioQueueManager {
   }
 
   /**
-   * Persist current queue state to MongoDB.
+   * Persist current staging Map state to MongoDB.
    * Called by heartbeat timer and on graceful shutdown.
    */
   async persistState() {
@@ -206,14 +268,28 @@ class PodioQueueManager {
   }
 
   /**
-   * Saves remaining (unprocessed) items to MongoDB every 10 minutes.
-   * On server restart, init() loads this back — crash recovery mechanism.
+   * Heartbeat — persist staging Map every 10 minutes as fallback.
+   * BullMQ handles primary durability via Redis, this is belt-and-suspenders.
    */
   _startHeartbeat() {
-    setInterval(() => this.persistState(), HEARTBEAT_INTERVAL);
+    this.heartbeatTimer = setInterval(
+      () => this.persistState(),
+      HEARTBEAT_INTERVAL,
+    );
+  }
+
+  /**
+   * Graceful shutdown — close workers, persist state, clear heartbeat.
+   */
+  async shutdown() {
+    logger.info("[Queue] Shutting down workers...");
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.flushWorker) await this.flushWorker.close();
+    if (this.batchWorker) await this.batchWorker.close();
+    await this.persistState();
+    logger.info("[Queue] Workers closed and state persisted.");
   }
 }
 
 const instance = new PodioQueueManager();
-Object.freeze(instance);
 module.exports = instance;

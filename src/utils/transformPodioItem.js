@@ -16,13 +16,13 @@ const transformPodioItem = (raw) => {
   });
 
   return {
-    item_id: raw.item_id,
-    app_id: raw.app_id,
-    app_item_id: raw.app_item_id,
+    itemId: raw.item_id,
+    appId: raw.app_id,
+    appItemId: raw.app_item_id,
     title: raw.title || null,
     data: fields,
-    podio_created_on: raw.created_on ? new Date(raw.created_on) : null,
-    podio_last_event_on: raw.last_event_on
+    podioCreatedOn: raw.created_on ? new Date(raw.created_on) : null,
+    podioLastEventOn: raw.last_event_on
       ? new Date(raw.last_event_on)
       : null,
   };

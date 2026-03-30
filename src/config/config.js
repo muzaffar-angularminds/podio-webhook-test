@@ -10,9 +10,8 @@ const envVarsSchema = Joi.object({
   MONGODB_URL: Joi.string().required(),
   PODIO_CLIENT_ID: Joi.string().required(),
   PODIO_CLIENT_SECRET: Joi.string().required(),
-  PODIO_APP_ID: Joi.string().required(),
-  PODIO_APP_TOKEN: Joi.string().required(),
   PODIO_WEBHOOK_SECRET: Joi.string().required(),
+  REDIS_URL: Joi.string().default("redis://localhost:6379"),
 }).unknown();
 
 const { value: envVars, error } = envVarsSchema.validate(process.env, {
@@ -29,7 +28,6 @@ module.exports = {
   MONGODB_URL: envVars.MONGODB_URL,
   PODIO_CLIENT_ID: envVars.PODIO_CLIENT_ID,
   PODIO_CLIENT_SECRET: envVars.PODIO_CLIENT_SECRET,
-  PODIO_APP_ID: envVars.PODIO_APP_ID,
-  PODIO_APP_TOKEN: envVars.PODIO_APP_TOKEN,
   PODIO_WEBHOOK_SECRET: envVars.PODIO_WEBHOOK_SECRET,
+  REDIS_URL: envVars.REDIS_URL,
 };

@@ -1,24 +1,26 @@
 const mongoose = require("mongoose");
+const { softDelete } = require("./pluggins");
 
 const podioItemSchema = mongoose.Schema(
   {
-    app_id: { type: Number, required: true },
-    item_id: { type: Number, required: true },
+    appId: { type: Number, required: true },
+    itemId: { type: Number, required: true },
     data: { type: mongoose.Schema.Types.Mixed },
     title: { type: String, default: null },
-    podio_last_updated_at: { type: Date, default: null },
-    sync_status: {
+    podioLastUpdatedAt: { type: Date, default: null },
+    syncStatus: {
       type: String,
       enum: ["success", "failed", "pending"],
       default: "pending",
     },
-    last_synced_at: { type: Date, default: null },
-    sync_error: { type: String, default: null },
+    lastSyncedAt: { type: Date, default: null },
+    syncError: { type: String, default: null },
   },
   { timestamps: true },
 );
 
-podioItemSchema.index({ item_id: 1, app_id: 1 }, { unique: true });
+podioItemSchema.index({ itemId: 1, appId: 1 }, { unique: true });
+softDelete(podioItemSchema);
 
 const PodioItem = mongoose.model("podio_item", podioItemSchema);
 module.exports = PodioItem;

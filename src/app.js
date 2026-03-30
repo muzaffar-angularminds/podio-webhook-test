@@ -11,7 +11,27 @@ const { errorConverter, errorHandler } = require("./middlewares/error");
 const cookieParser = require("cookie-parser");
 const ApiError = require("./utils/apiError");
 
+// Bull Board
+const { createBullBoard } = require("@bull-board/api");
+const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
+const { ExpressAdapter } = require("@bull-board/express");
+const { flushQueue, batchQueue, appQueue, seedQueue } = require("./queues");
+
 const app = express();
+
+// Bull Board UI at /admin/queues
+const serverAdapter = new ExpressAdapter();
+serverAdapter.setBasePath("/admin/queues");
+createBullBoard({
+  queues: [
+    new BullMQAdapter(flushQueue),
+    new BullMQAdapter(batchQueue),
+    new BullMQAdapter(appQueue),
+    new BullMQAdapter(seedQueue),
+  ],
+  serverAdapter,
+});
+app.use("/admin/queues", serverAdapter.getRouter());
 
 if (config.NODE_ENV !== "test") {
   app.use(morgan.successHandler);
@@ -19,7 +39,19 @@ if (config.NODE_ENV !== "test") {
 }
 
 // Set necessary HTTP headers for app security
-app.use(helmet());
+// Allow inline scripts for admin pages
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+        "script-src": ["'self'", "'unsafe-inline'"],
+        "script-src-attr": ["'unsafe-inline'"],
+        "style-src": ["'self'", "'unsafe-inline'"],
+      },
+    },
+  }),
+);
 
 // JSON requests are received as plain text. We need to parse the json request body.
 app.use(express.json());
@@ -41,13 +73,10 @@ app.use(
 // Enable cors to accept requests from any frontend domain, all possible HTTP methods, and necessary items in request headers
 app.use(
   cors({
-    // Allow requests from configured allowed domains
-    // Also allow non-browser clients that do not set an Origin header (e.g. curl, Postman).
     origin: (origin, callback) => {
       // No origin (server-to-server, curl) -> allow
       if (!origin) return callback(null, true);
 
-      // Check if origin matches any allowed domain
       if (config.NODE_ENV === "production") return callback(null, true);
 
       // In development, allow localhost with any port and 192.168.x.x IPs
@@ -58,10 +87,9 @@ app.use(
           return callback(null, true);
       }
 
-      // Otherwise reject
       return callback(new Error("Not allowed by CORS"));
     },
-    credentials: true, // Necessary for cookies
+    credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
   }),
@@ -74,6 +102,9 @@ app.use(cookieParser());
 if (config.NODE_ENV === "production") {
   app.use("/auth", authLimiter);
 }
+
+// Empty favicon to prevent 404 errors
+app.get("/favicon.ico", (req, res) => res.status(204).end());
 
 // Define routes index in separate file.
 app.use("/", route);

@@ -2,36 +2,26 @@ const express = require("express");
 const router = express.Router();
 const config = require("./config/config");
 
-// const docsRoute = require("./docs/docs.route");
-
-//main routes
 const webhookRoute = require("./webhooks/route");
+const adminRoute = require("./admin/admin.route");
 
-// Routes index
 const defaultRoutes = [
   {
     path: "/webhooks/podio",
     route: webhookRoute,
   },
-  //   {
-  //     path: "/users",
-  //     route: userRoute,
-  //   },
+  {
+    path: "/admin",
+    route: adminRoute,
+  },
 ];
 
-//Swagger documentation route available only in development mode
-const devRoutes = [
-  //   {
-  //     path: "/docs",
-  //     route: docsRoute,
-  //   },
-];
+const devRoutes = [];
 
 defaultRoutes.forEach((route) => {
   router.use(`${route.path}`, route.route);
 });
 
-/* istanbul ignore next */
 if (config.NODE_ENV === "development") {
   devRoutes.forEach((route) => {
     router.use(`${route.path}`, route.route);
