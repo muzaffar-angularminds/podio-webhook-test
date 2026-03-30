@@ -2,6 +2,7 @@ const catchAsync = require("../utils/catchAsync");
 const { verifyWebhook } = require("./service");
 const queueManager = require("../utils/podioQueueManager");
 const PodioItem = require("../db/podio-item.model");
+const { appQueue } = require("../queues");
 const logger = require("../config/logger");
 
 const handleWebhook = catchAsync(async (req, res) => {
@@ -19,8 +20,6 @@ const handleWebhook = catchAsync(async (req, res) => {
 
       case "item.create":
       case "item.update": {
-        // No idempotency check — the staging Map's Set handles dedup.
-        // Same item enqueued 100 times = stored once in the Set.
         await queueManager.enqueue(app_id, item_id);
         logger.info(
           `[Webhook] ${type} enqueued: app=${app_id} item=${item_id}`,
@@ -33,6 +32,26 @@ const handleWebhook = catchAsync(async (req, res) => {
         logger.info(
           `[Webhook] item.delete soft-deleted: app=${app_id} item=${item_id}`,
         );
+        break;
+      }
+
+      case "app.update": {
+        await appQueue.add(
+          "app-event",
+          { type, appId: app_id },
+          { jobId: `app-update-${app_id}-${Date.now()}` },
+        );
+        logger.info(`[Webhook] app.update enqueued: app=${app_id}`);
+        break;
+      }
+
+      case "app.delete": {
+        await appQueue.add(
+          "app-event",
+          { type, appId: app_id },
+          { jobId: `app-delete-${app_id}-${Date.now()}` },
+        );
+        logger.info(`[Webhook] app.delete enqueued: app=${app_id}`);
         break;
       }
     }

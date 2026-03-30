@@ -4,6 +4,7 @@ const config = require("./config/config");
 const logger = require("./config/logger");
 const { redis } = require("./config/redis");
 const queueManager = require("./utils/podioQueueManager");
+const { cleanupStaleReseeds } = require("./queues/secondaryWorker");
 
 let server;
 logger.info(`Node Environment => ${config.NODE_ENV}`);
@@ -12,10 +13,13 @@ logger.info(`Node Environment => ${config.NODE_ENV}`);
 mongoose.connect(config.MONGODB_URL).then(async () => {
   logger.info(`Connected to MongoDB => ${config.MONGODB_URL}`);
 
+  // Check for stale reseeds from previous crashes
+  await cleanupStaleReseeds();
+
   // Recover any pending queue items from DB
   await queueManager.init();
 
-  // Start BullMQ workers (flush + batch)
+  // Start BullMQ workers (flush + batch + secondary)
   queueManager.startWorkers();
 
   server = app.listen(config.PORT, () => {
@@ -30,7 +34,10 @@ mongoose.connect(config.MONGODB_URL).then(async () => {
 });
 
 // Graceful shutdown: close workers → close server → disconnect Redis + MongoDB → exit
+let isShuttingDown = false;
 const gracefulShutdown = async (signal) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
   // Close BullMQ workers and persist staging Map

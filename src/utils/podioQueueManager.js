@@ -4,6 +4,7 @@ const PodioItem = require("../db/podio-item.model");
 const podioClient = require("../webhooks/client");
 const transformPodioItem = require("./transformPodioItem");
 const { flushQueue, batchQueue } = require("../queues");
+const { createSecondaryWorker } = require("../queues/secondaryWorker");
 const config = require("../config/config");
 const logger = require("../config/logger");
 
@@ -19,6 +20,7 @@ class PodioQueueManager {
     this.appMap = new Map();
     this.flushWorker = null;
     this.batchWorker = null;
+    this.secondaryWorker = null;
     this.heartbeatTimer = null;
 
     PodioQueueManager.instance = this;
@@ -67,8 +69,9 @@ class PodioQueueManager {
   startWorkers() {
     this._startFlushWorker();
     this._startBatchWorker();
+    this.secondaryWorker = createSecondaryWorker();
     this._startHeartbeat();
-    logger.info("[Queue] Workers started");
+    logger.info("[Queue] Workers started (flush + batch + secondary)");
   }
 
   /**
@@ -286,6 +289,7 @@ class PodioQueueManager {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.flushWorker) await this.flushWorker.close();
     if (this.batchWorker) await this.batchWorker.close();
+    if (this.secondaryWorker) await this.secondaryWorker.close();
     await this.persistState();
     logger.info("[Queue] Workers closed and state persisted.");
   }
