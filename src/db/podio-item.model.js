@@ -6,8 +6,10 @@ const podioItemSchema = mongoose.Schema(
     appId: { type: Number, required: true },
     itemId: { type: Number, required: true },
     data: { type: mongoose.Schema.Types.Mixed },
+    appItemId: { type: Number, default: null },
     title: { type: String, default: null },
-    podioLastUpdatedAt: { type: Date, default: null },
+    podioCreatedOn: { type: Date, default: null },
+    podioLastEventOn: { type: Date, default: null },
     syncStatus: {
       type: String,
       enum: ["success", "failed", "pending"],

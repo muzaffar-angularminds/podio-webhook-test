@@ -23,5 +23,7 @@ const appSchemaModel = mongoose.Schema(
   { timestamps: true },
 );
 
+appSchemaModel.index({ reseedStatus: 1 });
+
 const AppSchema = mongoose.model("app_schema", appSchemaModel);
 module.exports = AppSchema;

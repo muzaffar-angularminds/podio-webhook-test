@@ -39,14 +39,12 @@ if (config.NODE_ENV !== "test") {
 }
 
 // Set necessary HTTP headers for app security
-// Allow inline scripts for admin pages
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-        "script-src": ["'self'", "'unsafe-inline'"],
-        "script-src-attr": ["'unsafe-inline'"],
+        "script-src": ["'self'"],
         "style-src": ["'self'", "'unsafe-inline'"],
       },
     },
@@ -109,8 +107,24 @@ app.get("/favicon.ico", (req, res) => res.status(204).end());
 // Define routes index in separate file.
 app.use("/", route);
 
-// Server status route
-app.get("/status", (req, res) => res.sendStatus(200));
+// Health check — verifies MongoDB and Redis connectivity
+app.get("/status", async (req, res) => {
+  const mongoose = require("mongoose");
+  const { redis } = require("./config/redis");
+
+  const health = {
+    status: "ok",
+    mongo: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    redis: redis.status === "ready" ? "connected" : redis.status,
+  };
+
+  if (health.mongo !== "connected" || health.redis !== "connected") {
+    health.status = "degraded";
+    return res.status(503).json(health);
+  }
+
+  res.json(health);
+});
 
 // Send back a 404 error for any unknown api request
 app.use((req, res, next) => {

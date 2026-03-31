@@ -11,7 +11,7 @@ const webhookStateSchema = mongoose.Schema(
     // This stores the array of pending item objects
     pendingItems: [
       {
-        itemId: { type: String, required: true },
+        itemId: { type: Number, required: true },
         createdAt: { type: Date, default: Date.now },
       },
     ],

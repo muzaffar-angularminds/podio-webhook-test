@@ -8,6 +8,7 @@ const podioClient = require("../webhooks/client");
 const transformPodioItem = require("../utils/transformPodioItem");
 const config = require("../config/config");
 const logger = require("../config/logger");
+const { acquireLock, releaseLock } = require("../config/redis");
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 500;
 const SEED_DELAY_MS = parseInt(process.env.SEED_DELAY_MS) || 15_000;
@@ -120,9 +121,18 @@ async function fetchPageWithRetry(appId, offset, attempt = 1) {
  */
 async function reseedApp(appId) {
   const appIdNum = Number(appId);
+  const lockKey = `reseed-lock-${appIdNum}`;
   const shadowName = `podio_items_staging_${appId}`;
   const shadowCollection = mongoose.connection.collection(shadowName);
   const swapStartTime = new Date();
+
+  // Acquire distributed lock — prevent concurrent reseeds of the same app
+  // TTL 2 hours covers even the largest apps (200K+ items)
+  const lockAcquired = await acquireLock(lockKey, 7200);
+  if (!lockAcquired) {
+    logger.warn(`[Reseed] App ${appId}: reseed already in progress (lock held). Skipping.`);
+    return;
+  }
 
   // Check if there's a stale in-progress reseed with an existing shadow collection
   const existing = await AppSchema.findOne({ appId: appIdNum });
@@ -319,6 +329,7 @@ async function reseedApp(appId) {
     );
 
     logger.info(`[Reseed] App ${appId}: reseed completed successfully (${fetched} items)`);
+    await releaseLock(lockKey);
   } catch (err) {
     logger.error(`[Reseed] App ${appId} failed: ${err.message}`);
 
@@ -347,6 +358,7 @@ async function reseedApp(appId) {
       },
     );
 
+    await releaseLock(lockKey);
     throw err;
   }
 }
@@ -360,13 +372,27 @@ async function cleanupStaleReseeds() {
   try {
     const stale = await AppSchema.find({ reseedStatus: "in_progress" });
     for (const schema of stale) {
-      logger.warn(`[Reseed] Found stale in-progress reseed for app ${schema.appId}. Will resume on next trigger.`);
-      // Don't auto-cleanup — leave shadow for resume. Just mark as failed so it can be retried.
+      logger.warn(`[Reseed] Found stale in-progress reseed for app ${schema.appId}. Restoring data...`);
+
+      // Restore any soft-deleted items from the interrupted reseed
+      const mainCollection = mongoose.connection.collection(PodioItem.collection.collectionName);
+      const restored = await mainCollection.updateMany(
+        { appId: schema.appId, deleted: true },
+        { $set: { deleted: false }, $unset: { deletedAt: "" } },
+      );
+      if (restored.modifiedCount > 0) {
+        logger.info(`[Reseed] App ${schema.appId}: restored ${restored.modifiedCount} soft-deleted items`);
+      }
+
+      // Release any stale Redis lock
+      await releaseLock(`reseed-lock-${schema.appId}`);
+
+      // Mark as failed — shadow preserved for resume
       await AppSchema.findOneAndUpdate(
         { appId: schema.appId },
         {
           reseedStatus: "failed",
-          reseedError: "Server restarted during reseed. Shadow preserved for resume.",
+          reseedError: "Server restarted during reseed. Old data restored. Shadow preserved for resume.",
         },
       );
     }
@@ -468,7 +494,7 @@ function createSecondaryWorker() {
         logger.info(`[Secondary] App ${appId}: all items soft-deleted, schema removed, app deactivated`);
       }
     },
-    { connection: config.REDIS_URL, concurrency: 1 },
+    { connection: config.REDIS_URL, concurrency: 1, lockDuration: 7_200_000 }, // 2hr — reseeds can be long
   );
 
   worker.on("completed", (job) => {

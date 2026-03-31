@@ -14,11 +14,17 @@ const listApps = catchAsync(async (req, res) => {
   res.json(apps);
 });
 
+const isValidId = (id) => /^\d+$/.test(String(id));
+
 const addApp = catchAsync(async (req, res) => {
   const { appId, appToken, appName, spaceId } = req.body;
 
   if (!appId || !appToken) {
     return res.status(400).json({ message: "appId and appToken are required" });
+  }
+
+  if (!isValidId(appId)) {
+    return res.status(400).json({ message: "appId must be a positive integer" });
   }
 
   const existing = await PodioApp.findOne({ appId: Number(appId) });

@@ -38,7 +38,6 @@
       gap: 0.75rem;
       margin-bottom: 0.75rem;
     }
-    .form-row.full { grid-template-columns: 1fr; }
     label {
       display: block;
       font-size: 0.75rem;
@@ -72,10 +71,7 @@
     .btn-warning { background: #ff9500; color: #fff; }
     .btn-danger { background: #ff3b30; color: #fff; }
     .btn-sm { padding: 0.35rem 0.75rem; font-size: 0.75rem; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
+    table { width: 100%; border-collapse: collapse; }
     th {
       text-align: left;
       padding: 0.5rem 0.75rem;
@@ -128,10 +124,7 @@
       font-size: 0.8rem;
       color: #999;
     }
-    .nav {
-      margin-bottom: 1.5rem;
-      font-size: 0.85rem;
-    }
+    .nav { margin-bottom: 1.5rem; font-size: 0.85rem; }
     .nav a {
       color: #4f6ef7;
       text-decoration: none;
@@ -149,7 +142,6 @@
 
     <h1>Podio App Registry</h1>
 
-    <!-- Add App Form -->
     <div class="card">
       <h2>Register New App</h2>
       <form id="addForm">
@@ -179,7 +171,6 @@
       </form>
     </div>
 
-    <!-- App List -->
     <div class="card">
       <h2>Registered Apps</h2>
       <div id="appList"></div>
@@ -187,139 +178,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-
-  <script>
-    const API = '/admin/api/apps';
-
-    function toast(msg) {
-      const el = document.getElementById('toast');
-      el.textContent = msg;
-      el.classList.add('show');
-      setTimeout(() => el.classList.remove('show'), 2500);
-    }
-
-    function maskToken(token) {
-      if (!token) return '-';
-      return token.substring(0, 6) + '...' + token.substring(token.length - 4);
-    }
-
-    function formatDate(d) {
-      if (!d) return '-';
-      return new Date(d).toLocaleString();
-    }
-
-    async function loadApps() {
-      const res = await fetch(API);
-      const apps = await res.json();
-      const container = document.getElementById('appList');
-
-      if (apps.length === 0) {
-        container.innerHTML = '<div class="empty">No apps registered yet.</div>';
-        return;
-      }
-
-      container.innerHTML = `
-        <table>
-          <thead>
-            <tr>
-              <th>App ID</th>
-              <th>Name</th>
-              <th>Token</th>
-              <th>Space ID</th>
-              <th>Status</th>
-              <th>Last Seeded</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${apps.map(app => `
-              <tr>
-                <td><strong>${app.appId}</strong></td>
-                <td>${app.appName || '-'}</td>
-                <td><span class="token-mask">${maskToken(app.appToken)}</span></td>
-                <td>${app.spaceId || '-'}</td>
-                <td>
-                  <span class="badge ${app.isActive ? 'badge-active' : 'badge-inactive'}">
-                    ${app.isActive ? 'Active' : 'Inactive'}
-                  </span>
-                </td>
-                <td>${formatDate(app.lastSeededAt)}</td>
-                <td>
-                  <div class="actions">
-                    <button class="btn btn-sm ${app.isActive ? 'btn-warning' : 'btn-success'}"
-                            onclick="toggleApp(${app.appId})">
-                      ${app.isActive ? 'Deactivate' : 'Activate'}
-                    </button>
-                    <button class="btn btn-sm btn-danger" onclick="deleteApp(${app.appId})">
-                      Delete
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      `;
-    }
-
-    document.getElementById('addForm').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const body = {
-        appId: document.getElementById('appId').value,
-        appToken: document.getElementById('appToken').value,
-        appName: document.getElementById('appName').value,
-        spaceId: document.getElementById('spaceId').value,
-      };
-
-      const res = await fetch(API, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (res.ok) {
-        toast('App registered successfully');
-        document.getElementById('addForm').reset();
-        loadApps();
-      } else {
-        const err = await res.json();
-        toast(err.message || 'Failed to register app');
-      }
-    });
-
-    async function toggleApp(appId) {
-      try {
-        const res = await fetch(`${API}/${appId}/toggle`, { method: 'PATCH' });
-        if (res.ok) {
-          const app = await res.json();
-          toast(`App ${appId} ${app.isActive ? 'activated' : 'deactivated'}`);
-        } else {
-          const err = await res.json().catch(() => ({}));
-          toast(err.message || `Toggle failed: ${res.status}`);
-        }
-      } catch (e) {
-        toast(`Toggle error: ${e.message}`);
-      }
-      loadApps();
-    }
-
-    async function deleteApp(appId) {
-      if (!confirm('Delete app ' + appId + '? This cannot be undone.')) return;
-      try {
-        const res = await fetch(`${API}/${appId}`, { method: 'DELETE' });
-        if (res.ok) {
-          toast(`App ${appId} deleted`);
-        } else {
-          const err = await res.json().catch(() => ({}));
-          toast(err.message || `Delete failed: ${res.status}`);
-        }
-      } catch (e) {
-        toast(`Delete error: ${e.message}`);
-      }
-      loadApps();
-    }
-
-    loadApps();
-  </script>
+  <script src="/admin/views/apps.js"></script>
 </body>
 </html>

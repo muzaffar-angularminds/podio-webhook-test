@@ -9,9 +9,25 @@ const { cleanupStaleReseeds } = require("./queues/secondaryWorker");
 let server;
 logger.info(`Node Environment => ${config.NODE_ENV}`);
 
-// Connect to MongoDB and Redis, then start
-mongoose.connect(config.MONGODB_URL).then(async () => {
-  logger.info(`Connected to MongoDB => ${config.MONGODB_URL}`);
+// Connect to MongoDB with retry logic
+const MAX_MONGO_RETRIES = 5;
+async function connectWithRetry(attempt = 1) {
+  try {
+    await mongoose.connect(config.MONGODB_URL);
+    logger.info(`Connected to MongoDB => ${config.MONGODB_URL}`);
+  } catch (err) {
+    if (attempt >= MAX_MONGO_RETRIES) {
+      logger.error(`[MongoDB] Failed to connect after ${MAX_MONGO_RETRIES} attempts: ${err.message}`);
+      process.exit(1);
+    }
+    const delay = Math.pow(2, attempt) * 1000;
+    logger.warn(`[MongoDB] Connection attempt ${attempt} failed: ${err.message}. Retrying in ${delay / 1000}s...`);
+    await new Promise((r) => setTimeout(r, delay));
+    return connectWithRetry(attempt + 1);
+  }
+}
+
+connectWithRetry().then(async () => {
 
   // Check for stale reseeds from previous crashes
   await cleanupStaleReseeds();
@@ -41,17 +57,25 @@ const gracefulShutdown = async (signal) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
   // Close BullMQ workers and persist staging Map
-  await queueManager.shutdown();
+  try {
+    await queueManager.shutdown();
+  } catch (err) {
+    logger.error(`[Shutdown] Queue shutdown error: ${err.message}`);
+  }
 
   if (server) {
     server.close(async () => {
       try {
         await redis.quit();
         logger.info("Disconnected from Redis");
+      } catch (err) {
+        logger.error(`[Shutdown] Redis disconnect error: ${err.message}`);
+      }
+      try {
         await mongoose.disconnect();
         logger.info("Disconnected from MongoDB");
       } catch (err) {
-        logger.error("Error during disconnect:", err.message);
+        logger.error(`[Shutdown] MongoDB disconnect error: ${err.message}`);
       }
       logger.info("Server closed");
       process.exit(0);

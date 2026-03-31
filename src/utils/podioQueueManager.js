@@ -22,6 +22,7 @@ class PodioQueueManager {
     this.batchWorker = null;
     this.secondaryWorker = null;
     this.heartbeatTimer = null;
+    this._persistInFlight = null;
 
     PodioQueueManager.instance = this;
     return this;
@@ -35,7 +36,7 @@ class PodioQueueManager {
   async enqueue(appId, itemId) {
     const key = String(appId);
     if (!this.appMap.has(key)) this.appMap.set(key, new Set());
-    this.appMap.get(key).add(String(itemId));
+    this.appMap.get(key).add(Number(itemId));
     logger.debug(`[Queue] Enqueued item ${itemId} for app ${appId}`);
 
     await this._scheduleFlush(key);
@@ -86,7 +87,7 @@ class PodioQueueManager {
         const key = String(state.appId);
         if (!this.appMap.has(key)) this.appMap.set(key, new Set());
         for (const i of state.pendingItems) {
-          this.appMap.get(key).add(String(i.itemId));
+          this.appMap.get(key).add(Number(i.itemId));
           recovered++;
         }
         // Schedule flush for recovered items
@@ -129,7 +130,7 @@ class PodioQueueManager {
           });
         }
       },
-      { connection: config.REDIS_URL, concurrency: 1 },
+      { connection: config.REDIS_URL, concurrency: 1, lockDuration: 60_000 },
     );
 
     this.flushWorker.on("completed", (job) => {
@@ -155,6 +156,7 @@ class PodioQueueManager {
       {
         connection: config.REDIS_URL,
         concurrency: 1,
+        lockDuration: 120_000, // 2 min — Podio API calls can be slow
         limiter: { max: 240, duration: 3_600_000 }, // 240/hr, under 250/hr limit
       },
     );
@@ -275,10 +277,11 @@ class PodioQueueManager {
    * BullMQ handles primary durability via Redis, this is belt-and-suspenders.
    */
   _startHeartbeat() {
-    this.heartbeatTimer = setInterval(
-      () => this.persistState(),
-      HEARTBEAT_INTERVAL,
-    );
+    this.heartbeatTimer = setInterval(() => {
+      this._persistInFlight = this.persistState().finally(() => {
+        this._persistInFlight = null;
+      });
+    }, HEARTBEAT_INTERVAL);
   }
 
   /**
@@ -287,6 +290,11 @@ class PodioQueueManager {
   async shutdown() {
     logger.info("[Queue] Shutting down workers...");
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    // Wait for any in-flight heartbeat persist to finish
+    if (this._persistInFlight) {
+      logger.info("[Queue] Waiting for in-flight persist to complete...");
+      await this._persistInFlight;
+    }
     if (this.flushWorker) await this.flushWorker.close();
     if (this.batchWorker) await this.batchWorker.close();
     if (this.secondaryWorker) await this.secondaryWorker.close();
