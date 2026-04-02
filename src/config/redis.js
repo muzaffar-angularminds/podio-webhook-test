@@ -2,10 +2,42 @@ const Redis = require("ioredis");
 const config = require("./config");
 const logger = require("./logger");
 
-const redis = new Redis(config.REDIS_URL);
+let redisErrorLogged = false;
 
-redis.on("connect", () => logger.info("[Redis] Connected"));
-redis.on("error", (err) => logger.error("[Redis] Error:", err.message));
+const redisOptions = {
+  maxRetriesPerRequest: null, // required by BullMQ
+  retryStrategy(times) {
+    const delay = Math.min(times * 2000, 30000);
+    return delay;
+  },
+};
+
+const redis = new Redis(config.REDIS_URL, redisOptions);
+
+redis.on("connect", () => {
+  if (redisErrorLogged) {
+    logger.info("[Redis] Reconnected");
+  } else {
+    logger.info("[Redis] Connected");
+  }
+  redisErrorLogged = false;
+});
+redis.on("error", (err) => {
+  if (!redisErrorLogged) {
+    logger.error(`[Redis] Connection failed: ${err.message}. Will keep retrying...`);
+    redisErrorLogged = true;
+  }
+});
+
+/**
+ * Create a duplicate Redis connection that shares our config.
+ * Errors are silently absorbed — the main connection handles logging.
+ */
+const createDuplicate = () => {
+  const dup = redis.duplicate();
+  dup.on("error", () => {}); // suppress — main connection logs errors
+  return dup;
+};
 
 /**
  * Check if a webhook event was already processed (idempotency).
@@ -43,4 +75,4 @@ const releaseLock = async (lockKey) => {
   await redis.del(lockKey);
 };
 
-module.exports = { redis, checkIdempotency, markProcessed, acquireLock, releaseLock };
+module.exports = { redis, createDuplicate, checkIdempotency, markProcessed, acquireLock, releaseLock };

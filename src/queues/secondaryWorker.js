@@ -6,9 +6,9 @@ const PodioItem = require("../db/podio-item.model");
 const PodioApp = require("../db/podio-app.model");
 const podioClient = require("../webhooks/client");
 const transformPodioItem = require("../utils/transformPodioItem");
-const config = require("../config/config");
 const logger = require("../config/logger");
 const { acquireLock, releaseLock } = require("../config/redis");
+const { createDuplicate } = require("./index");
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 500;
 const SEED_DELAY_MS = parseInt(process.env.SEED_DELAY_MS) || 15_000;
@@ -494,7 +494,7 @@ function createSecondaryWorker() {
         logger.info(`[Secondary] App ${appId}: all items soft-deleted, schema removed, app deactivated`);
       }
     },
-    { connection: config.REDIS_URL, concurrency: 1, lockDuration: 7_200_000 }, // 2hr — reseeds can be long
+    { connection: createDuplicate(), concurrency: 1, lockDuration: 7_200_000 }, // 2hr — reseeds can be long
   );
 
   worker.on("completed", (job) => {

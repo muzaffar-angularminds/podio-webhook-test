@@ -3,9 +3,8 @@ const WebhookState = require("../db/webhook-state.model");
 const PodioItem = require("../db/podio-item.model");
 const podioClient = require("../webhooks/client");
 const transformPodioItem = require("./transformPodioItem");
-const { flushQueue, batchQueue } = require("../queues");
+const { flushQueue, batchQueue, createDuplicate } = require("../queues");
 const { createSecondaryWorker } = require("../queues/secondaryWorker");
-const config = require("../config/config");
 const logger = require("../config/logger");
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 500;
@@ -128,7 +127,7 @@ class PodioQueueManager {
           });
         }
       },
-      { connection: config.REDIS_URL, concurrency: 1, lockDuration: 60_000 },
+      { connection: createDuplicate(), concurrency: 1, lockDuration: 60_000 },
     );
 
     this.flushWorker.on("completed", (job) => {
@@ -154,7 +153,7 @@ class PodioQueueManager {
         await this._fetchBatch(appId, itemIds);
       },
       {
-        connection: config.REDIS_URL,
+        connection: createDuplicate(),
         concurrency: 1,
         lockDuration: 120_000, // 2 min — Podio API calls can be slow
         limiter: { max: 240, duration: 3_600_000 }, // 240/hr, under 250/hr limit
