@@ -56,12 +56,10 @@ class PodioQueueManager {
         await job.remove();
       }
     }
-    await flushQueue.add(
-      "flush",
-      { appId },
-      { jobId, delay: FLUSH_DELAY },
+    await flushQueue.add("flush", { appId }, { jobId, delay: FLUSH_DELAY });
+    logger.debug(
+      `[Queue] Flush scheduled for app ${appId} in ${FLUSH_DELAY}ms`,
     );
-    logger.debug(`[Queue] Flush scheduled for app ${appId} in ${FLUSH_DELAY}ms`);
   }
 
   /**
@@ -138,7 +136,9 @@ class PodioQueueManager {
     });
 
     this.flushWorker.on("failed", (job, err) => {
-      logger.error(`[Queue] Flush job failed for ${job?.data?.appId}: ${err.message}`);
+      logger.error(
+        `[Queue] Flush job failed for ${job?.data?.appId}: ${err.message}`,
+      );
     });
   }
 
@@ -253,7 +253,7 @@ class PodioQueueManager {
    * Called by heartbeat timer and on graceful shutdown.
    */
   async persistState() {
-    logger.info("[Queue] Persisting queue state to DB...");
+    logger.debug("[Queue] Persisting queue state to DB...");
     try {
       for (const [appId, itemSet] of this.appMap) {
         const pendingItems = [...itemSet].map((itemId) => ({
@@ -266,7 +266,7 @@ class PodioQueueManager {
           { upsert: true, returnDocument: "after" },
         );
       }
-      logger.info("[Queue] State persisted.");
+      logger.debug("[Queue] State persisted.");
     } catch (err) {
       logger.error("[Queue] Failed to persist state:", err.message);
     }
