@@ -40,24 +40,6 @@ const createDuplicate = () => {
 };
 
 /**
- * Check if a webhook event was already processed (idempotency).
- * @returns {boolean} true if already processed
- */
-const checkIdempotency = async (key) => {
-  const exists = await redis.get(key);
-  return !!exists;
-};
-
-/**
- * Mark a webhook event as processed.
- * @param {string} key
- * @param {number} ttl - TTL in seconds (default 24hrs)
- */
-const markProcessed = async (key, ttl = 86400) => {
-  await redis.set(key, "1", "EX", ttl);
-};
-
-/**
  * Acquire a distributed lock. Returns true if acquired, false if already held.
  * @param {string} lockKey
  * @param {number} ttlSeconds - lock auto-expires after this many seconds
@@ -75,4 +57,4 @@ const releaseLock = async (lockKey) => {
   await redis.del(lockKey);
 };
 
-module.exports = { redis, createDuplicate, checkIdempotency, markProcessed, acquireLock, releaseLock };
+module.exports = { redis, createDuplicate, acquireLock, releaseLock };

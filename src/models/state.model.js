@@ -1,14 +1,12 @@
 const mongoose = require("mongoose");
 
-const webhookStateSchema = mongoose.Schema(
+const stateSchema = mongoose.Schema(
   {
-    // We use appId as the unique key to group items
     appId: {
       type: String,
       required: true,
       unique: true,
     },
-    // This stores the array of pending item objects
     pendingItems: [
       {
         itemId: { type: Number, required: true },
@@ -23,5 +21,5 @@ const webhookStateSchema = mongoose.Schema(
   { timestamps: true },
 );
 
-const WebhookState = mongoose.model("webhook_state", webhookStateSchema);
-module.exports = WebhookState;
+const State = mongoose.model("state", stateSchema);
+module.exports = State;

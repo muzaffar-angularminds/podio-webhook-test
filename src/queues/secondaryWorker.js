@@ -1,105 +1,106 @@
 const { Worker, UnrecoverableError } = require("bullmq");
 const crypto = require("crypto");
 const mongoose = require("mongoose");
-const AppSchema = require("../db/app-schema.model");
-const PodioItem = require("../db/podio-item.model");
-const PodioApp = require("../db/podio-app.model");
+const AppSchema = require("../models/app-schema.model");
+const AppSchemaLogs = require("../models/app-schema-logs.model");
+const AppItems = require("../models/app-items.model");
 const podioClient = require("../webhooks/client");
-const transformPodioItem = require("../utils/transformPodioItem");
+const transformAppItem = require("../utils/transformAppItem");
+const diffSchemas = require("../utils/diffSchemas");
+const config = require("../config/config");
+const apps = require("../config/apps");
 const logger = require("../config/logger");
 const { acquireLock, releaseLock } = require("../config/redis");
 const { createDuplicate } = require("./index");
 
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 500;
-const SEED_DELAY_MS = parseInt(process.env.SEED_DELAY_MS) || 15_000;
-const PAGE_MAX_RETRIES = 3;
-const PAGE_RETRY_DELAY_MS = 10_000;
+const PAGE_MAX_RETRIES = 5;
+const PAGE_RETRY_BASE_MS = 10_000;
+const RATE_LIMIT_PAUSE_MS = 60_000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Compare two schema field arrays and return a list of structural changes.
+ * Fetch a single page from Podio with robust retry logic.
+ * - 420 (rate limit): waits 60s then retries (does NOT count as an attempt)
+ * - 5xx/network: exponential backoff (10s → 20s → 40s → 80s → 160s), max 5 attempts
+ * - 4xx (except 420): permanent error, throws immediately
  */
-function diffSchemas(oldFields, newFields) {
-  const changes = [];
-  const oldMap = new Map((oldFields || []).map((f) => [f.field_id, f]));
-  const newMap = new Map((newFields || []).map((f) => [f.field_id, f]));
-
-  for (const [id, newField] of newMap) {
-    if (!oldMap.has(id)) {
-      changes.push({ type: "field_added", fieldId: id, label: newField.config?.label });
-    } else {
-      const old = oldMap.get(id);
-      if (old.config?.label !== newField.config?.label) {
-        changes.push({
-          type: "field_renamed",
-          fieldId: id,
-          from: old.config?.label,
-          to: newField.config?.label,
-        });
-      }
-      if (old.type !== newField.type) {
-        changes.push({ type: "field_type_changed", fieldId: id, from: old.type, to: newField.type });
-      }
-      if (newField.type === "category") {
-        const oldOpts = JSON.stringify(old.config?.settings?.options || []);
-        const newOpts = JSON.stringify(newField.config?.settings?.options || []);
-        if (oldOpts !== newOpts) {
-          changes.push({ type: "category_options_changed", fieldId: id, label: newField.config?.label });
-        }
-      }
-    }
-  }
-
-  for (const [id, oldField] of oldMap) {
-    if (!newMap.has(id)) {
-      changes.push({ type: "field_deleted", fieldId: id, label: oldField.config?.label });
-    }
-  }
-
-  return changes;
-}
-
 /**
- * Fetch a single page from Podio with retry logic.
- * Retries up to PAGE_MAX_RETRIES on transient errors (5xx/network).
- * Throws immediately on 4xx (permanent error).
+ * @param {object} options
+ * @param {string} [options.dateFrom] - Filter: created_on >= date (YYYY-MM-DD)
+ * @param {string} [options.dateTo] - Filter: created_on <= date (YYYY-MM-DD)
+ * @param {number} [options.batchSize] - Override batch size
  */
-async function fetchPageWithRetry(appId, offset, attempt = 1) {
+async function fetchPageWithRetry(appId, offset, options = {}, attempt = 1) {
+  const batchSize = options.batchSize || config.BATCH_SIZE;
+
   try {
+    logger.debug(
+      `[Reseed] Fetching page at offset ${offset} for app ${appId} (batch=${batchSize})...`,
+    );
+    const startTime = Date.now();
+
+    // Build filters and sort
+    const filters = {};
+    const hasDateFilter = options.dateFrom || options.dateTo;
+
+    if (hasDateFilter) {
+      const dateRange = {};
+      if (options.dateFrom) dateRange.from = `${options.dateFrom} 00:00:00`;
+      if (options.dateTo) dateRange.to = `${options.dateTo} 23:59:59`;
+      filters.created_on = dateRange;
+    }
+
+    const sortBy = hasDateFilter ? "created_on" : "item_id";
+
     const { data } = await podioClient.post(
       `/item/app/${appId}/filter/?hook=false`,
       {
-        filters: {},
-        limit: BATCH_SIZE,
+        filters,
+        limit: batchSize,
         offset,
-        sort_by: "item_id",
+        sort_by: sortBy,
         sort_desc: false,
       },
+      { timeout: 300_000 },
+    );
+    logger.debug(
+      `[Reseed] Page at offset ${offset} fetched in ${Date.now() - startTime}ms (${data.items?.length || 0} items)`,
     );
     return data;
   } catch (err) {
     const status = err.response?.status;
 
-    // 4xx = permanent, no point retrying
+    // 420 = rate limited — wait and retry (doesn't count as an attempt)
+    if (status === 420) {
+      logger.warn(
+        `[Reseed] Rate limited (420) at offset ${offset}. Pausing ${RATE_LIMIT_PAUSE_MS / 1000}s before retry...`,
+      );
+      await sleep(RATE_LIMIT_PAUSE_MS);
+      return fetchPageWithRetry(appId, offset, options, attempt);
+    }
+
+    // 4xx (except 420) = permanent error, no point retrying
     if (status && status >= 400 && status < 500) {
       logger.error(
         `[Reseed] Permanent ${status} from Podio at offset ${offset}: ${err.message}`,
       );
       if (err.response?.data) {
-        logger.error(`[Reseed] Podio response: ${JSON.stringify(err.response.data)}`);
+        logger.error(
+          `[Reseed] Podio response: ${JSON.stringify(err.response.data)}`,
+        );
       }
       throw err;
     }
 
-    // Transient error — retry
-    if (attempt < PAGE_MAX_RETRIES) {
-      const delay = PAGE_RETRY_DELAY_MS * attempt;
+    // 5xx/network = transient — exponential backoff
+    if (attempt <= PAGE_MAX_RETRIES) {
+      const delay = PAGE_RETRY_BASE_MS * Math.pow(2, attempt - 1); // 10s, 20s, 40s, 80s, 160s
       logger.warn(
-        `[Reseed] Page at offset ${offset} failed (attempt ${attempt}/${PAGE_MAX_RETRIES}): ${err.message}. Retrying in ${delay}ms...`,
+        `[Reseed] Page at offset ${offset} failed (attempt ${attempt}/${PAGE_MAX_RETRIES}): ${err.message}. Retrying in ${delay / 1000}s...`,
       );
       await sleep(delay);
-      return fetchPageWithRetry(appId, offset, attempt + 1);
+      return fetchPageWithRetry(appId, offset, options, attempt + 1);
     }
 
     logger.error(
@@ -110,45 +111,77 @@ async function fetchPageWithRetry(appId, offset, attempt = 1) {
 }
 
 /**
+ * Format seconds into human-readable duration.
+ */
+function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+/**
  * Reseed an app using the shadow collection + atomic swap approach.
  *
- * Production-grade features:
- * - Checkpoint resume: if script crashes at page 300, it restarts from 300 not 0
- * - Per-page retry: transient Podio errors retry 3 times with backoff
- * - $merge swap: uses MongoDB aggregate pipeline for fast collection swap
- * - Rollback on failure: restores soft-deleted items if swap fails
- * - Stale reseed cleanup: called on startup to handle orphaned shadows
+ * Production-grade for 100K+ items:
+ * - Checkpoint resume: round down to nearest BATCH_SIZE on resume
+ * - 420 rate limit handling: pause 60s and retry
+ * - Exponential backoff: 5 retries (10s → 20s → 40s → 80s → 160s)
+ * - ETA logging: estimated time remaining per page
+ * - Insert count verification: checks actual insertedCount
+ * - Distributed lock via Redis
  */
-async function reseedApp(appId) {
+/**
+ * @param {string|number} appId
+ * @param {object} [options]
+ * @param {string} [options.dateFrom] - Filter: created_on >= date
+ * @param {string} [options.dateTo] - Filter: created_on <= date
+ * @param {number} [options.batchSize] - Override batch size
+ */
+async function reseedApp(appId, options = {}) {
   const appIdNum = Number(appId);
+  const appConfig = apps.find((a) => a.appId === appIdNum);
+  const appLabel = appConfig ? `${appConfig.name} (${appId})` : String(appId);
+  const batchSize = options.batchSize || config.BATCH_SIZE;
   const lockKey = `reseed-lock-${appIdNum}`;
   const shadowName = `podio_items_staging_${appId}`;
   const shadowCollection = mongoose.connection.collection(shadowName);
   const swapStartTime = new Date();
 
-  // Acquire distributed lock — prevent concurrent reseeds of the same app
-  // TTL 2 hours covers even the largest apps (200K+ items)
-  const lockAcquired = await acquireLock(lockKey, 7200);
-  if (!lockAcquired) {
-    logger.warn(`[Reseed] App ${appId}: reseed already in progress (lock held). Skipping.`);
-    return;
+  // Acquire lock — skip locking if Redis is unavailable (standalone seed script)
+  let lockAcquired = false;
+  try {
+    lockAcquired = await acquireLock(lockKey, 14400); // 4 hours for large apps
+    if (!lockAcquired) {
+      logger.warn(
+        `[Reseed] ${appLabel}: reseed already in progress (lock held). Skipping.`,
+      );
+      return;
+    }
+  } catch (lockErr) {
+    logger.warn(
+      `[Reseed] ${appLabel}: Redis unavailable for lock, proceeding without lock`,
+    );
   }
 
-  // Check if there's a stale in-progress reseed with an existing shadow collection
   const existing = await AppSchema.findOne({ appId: appIdNum });
   let resumeOffset = 0;
 
-  if (existing?.reseedStatus === "in_progress" && existing?.reseedProgress?.current > 0) {
-    // Shadow collection exists from a previous interrupted run — resume from checkpoint
+  if (
+    existing?.reseedStatus === "in_progress" &&
+    existing?.reseedProgress?.current > 0
+  ) {
     const shadowCount = await shadowCollection.countDocuments().catch(() => 0);
     if (shadowCount > 0) {
-      resumeOffset = shadowCount; // Each doc = 1 item, resume from where we left off
+      // Round down to nearest BATCH_SIZE — partial page inserts may have occurred
+      resumeOffset = Math.floor(shadowCount / batchSize) * batchSize;
       logger.info(
-        `[Reseed] Resuming app ${appId} from offset ${resumeOffset} (${shadowCount} docs already in shadow)`,
+        `[Reseed] Resuming app ${appId} from offset ${resumeOffset} (${shadowCount} docs in shadow, rounded to page boundary)`,
       );
     }
   } else {
-    // Fresh start — drop any orphaned shadow collection
     try {
       await shadowCollection.drop();
     } catch (e) {
@@ -156,42 +189,54 @@ async function reseedApp(appId) {
     }
   }
 
-  logger.info(`[Reseed] Starting reseed for app ${appId}${resumeOffset > 0 ? ` (resuming from ${resumeOffset})` : ""}`);
+  logger.info(
+    `[Reseed] Starting reseed for app ${appId}${resumeOffset > 0 ? ` (resuming from ${resumeOffset})` : ""}${options.dateFrom || options.dateTo ? ` [date filter: ${options.dateFrom || "start"} → ${options.dateTo || "now"}]` : ""} (batch=${batchSize})`,
+  );
 
-  // Mark reseed in progress
   await AppSchema.findOneAndUpdate(
     { appId: appIdNum },
     {
       reseedStatus: "in_progress",
-      reseedStartedAt: resumeOffset > 0 ? existing.reseedStartedAt : swapStartTime,
-      reseedProgress: { current: resumeOffset, total: existing?.reseedProgress?.total || 0 },
+      reseedStartedAt:
+        resumeOffset > 0 ? existing.reseedStartedAt : swapStartTime,
+      reseedProgress: {
+        current: resumeOffset,
+        total: existing?.reseedProgress?.total || 0,
+      },
       reseedError: null,
     },
     { upsert: true },
   );
+
+  const fetchStartTime = Date.now();
 
   try {
     // ── Phase 1: Fetch all items into shadow collection ────────────────────
     let offset = resumeOffset;
     let total = null;
     let fetched = resumeOffset;
+    let pagesCompleted =
+      resumeOffset > 0 ? Math.floor(resumeOffset / batchSize) : 0;
 
     while (total === null || offset < total) {
-      const data = await fetchPageWithRetry(appId, offset);
+      const data = await fetchPageWithRetry(appId, offset, options);
 
       if (total === null) {
-        total = data.total || data.filtered || 0;
-        logger.info(`[Reseed] App ${appId}: ${total} total items to fetch`);
+        // Podio returns filtered count in data.filtered when filters are active
+        total = data.filtered ?? data.total ?? 0;
+        logger.info(
+          `[Reseed] ${appLabel}: ${total} items to fetch${(options.dateFrom || options.dateTo) ? " (date-filtered)" : ""}`,
+        );
 
         if (total === 0) {
-          logger.info(`[Reseed] App ${appId}: no items in Podio, nothing to seed`);
+          logger.info(`[Reseed] ${appLabel}: no items to seed`);
           break;
         }
       }
 
       if (data.items?.length) {
         const docs = data.items.map((raw) => {
-          const transformed = transformPodioItem({
+          const transformed = transformAppItem({
             ...raw,
             app_id: appIdNum,
           });
@@ -203,58 +248,89 @@ async function reseedApp(appId) {
           };
         });
 
-        // Use ordered insertMany with retry on duplicate key
+        logger.debug(
+          `[Reseed] Inserting ${docs.length} docs into shadow at offset ${offset}...`,
+        );
         try {
-          await shadowCollection.insertMany(docs, { ordered: false });
+          const result = await shadowCollection.insertMany(docs, { ordered: false });
+          const insertedCount = result.insertedCount || docs.length;
+          fetched += insertedCount;
+
+          if (insertedCount < docs.length) {
+            logger.warn(
+              `[Reseed] ${appLabel}: only ${insertedCount}/${docs.length} items inserted at offset ${offset} (duplicates skipped)`,
+            );
+          }
         } catch (insertErr) {
-          // Ignore duplicate key errors (E11000) from resume overlap
-          if (insertErr.code !== 11000 && !insertErr.message?.includes("E11000")) {
+          if (insertErr.code === 11000 || insertErr.message?.includes("E11000")) {
+            const insertedCount = insertErr.result?.insertedCount || 0;
+            fetched += insertedCount;
+            logger.debug(
+              `[Reseed] ${appLabel}: ${insertedCount} new + ${docs.length - insertedCount} duplicates at offset ${offset}`,
+            );
+          } else {
             throw insertErr;
           }
         }
-
-        fetched += data.items.length;
       }
 
-      // Checkpoint: save progress after every page
+      pagesCompleted++;
+
+      // Checkpoint
       await AppSchema.findOneAndUpdate(
         { appId: appIdNum },
         { reseedProgress: { current: fetched, total } },
       );
 
-      const totalPages = Math.ceil(total / BATCH_SIZE);
-      const currentPage = Math.floor(offset / BATCH_SIZE) + 1;
-      logger.info(`[Reseed] App ${appId}: page ${currentPage}/${totalPages} | ${fetched}/${total} items`);
+      // ETA calculation
+      const totalPages = Math.ceil(total / batchSize);
+      const elapsedMs = Date.now() - fetchStartTime;
+      const pagesFromStart =
+        pagesCompleted - (resumeOffset > 0 ? Math.floor(resumeOffset / batchSize) : 0);
+      const msPerPage = pagesFromStart > 0 ? elapsedMs / pagesFromStart : 0;
+      const remainingPages = totalPages - pagesCompleted;
+      const etaSeconds = msPerPage > 0 ? (remainingPages * msPerPage) / 1000 : 0;
 
-      offset += BATCH_SIZE;
+      logger.info(
+        `[Reseed] ${appLabel}: page ${pagesCompleted}/${totalPages} | ${fetched}/${total} items | ETA: ${formatDuration(etaSeconds)}`,
+      );
 
-      // Sleep between pages to respect rate limit
+      offset += batchSize;
+
       if (offset < total) {
-        await sleep(SEED_DELAY_MS);
+        await sleep(config.SEED_DELAY_MS);
       }
     }
 
     // ── Phase 2: Validate ──────────────────────────────────────────────────
+    logger.debug(`[Reseed] ${appLabel}: counting shadow collection docs...`);
     const shadowCount = await shadowCollection.countDocuments();
 
     if (total > 0 && shadowCount === 0) {
-      throw new Error(`Shadow collection is empty but Podio reported ${total} items`);
-    }
-
-    // Allow small tolerance (Podio might have items added/deleted during seed)
-    const tolerance = Math.max(10, Math.ceil(total * 0.01)); // 1% or 10, whichever is larger
-    if (Math.abs(shadowCount - total) > tolerance) {
-      logger.warn(
-        `[Reseed] App ${appId}: count mismatch — shadow=${shadowCount}, podio=${total} (tolerance=${tolerance}). Proceeding anyway.`,
+      throw new Error(
+        `Shadow collection is empty but Podio reported ${total} items`,
       );
     }
 
-    logger.info(`[Reseed] App ${appId}: shadow has ${shadowCount} docs, Podio reported ${total}`);
+    logger.info(`[Reseed] ${appLabel}: shadow has ${shadowCount} docs, expected ${total}`);
+
+    const tolerance = Math.max(10, Math.ceil(total * 0.02));
+    if (Math.abs(shadowCount - total) > tolerance) {
+      logger.warn(
+        `[Reseed] ${appLabel}: count mismatch — shadow=${shadowCount}, podio=${total} (tolerance=${tolerance}). Proceeding anyway.`,
+      );
+    }
+
+    logger.info(
+      `[Reseed] ${appLabel}: shadow has ${shadowCount} docs, Podio reported ${total}`,
+    );
 
     // ── Phase 2.5: Save app schema snapshot ──────────────────────────────
-    // Fetch and store the current app schema for future diffing
     try {
-      const { data: appData } = await podioClient.get(`/app/${appId}`);
+      logger.debug(`[Reseed] Fetching app schema for app ${appId}...`);
+      const { data: appData } = await podioClient.get(`/app/${appId}`, {
+        timeout: 300_000,
+      });
       const fieldsHash = crypto
         .createHash("md5")
         .update(JSON.stringify(appData.fields))
@@ -270,26 +346,32 @@ async function reseedApp(appId) {
         },
         { upsert: true },
       );
-      logger.info(`[Reseed] App ${appId}: schema snapshot saved (${appData.fields?.length || 0} fields)`);
+      logger.info(
+        `[Reseed] ${appLabel}: schema snapshot saved (${appData.fields?.length || 0} fields)`,
+      );
     } catch (schemaErr) {
-      logger.warn(`[Reseed] App ${appId}: failed to save schema snapshot: ${schemaErr.message}`);
-      // Non-fatal — continue with reseed
+      logger.warn(
+        `[Reseed] ${appLabel}: failed to save schema snapshot: ${schemaErr.message}`,
+      );
     }
 
     // ── Phase 3: Swap ──────────────────────────────────────────────────────
-    // Soft-delete old items
-    await PodioItem.delete({ appId: appIdNum });
-    logger.info(`[Reseed] App ${appId}: old items soft-deleted`);
+    logger.debug(
+      `[Reseed] ${appLabel}: starting swap — soft-deleting old items...`,
+    );
+    await AppItems.delete({ appId: appIdNum });
+    logger.info(`[Reseed] ${appLabel}: old items soft-deleted`);
 
-    // Use aggregate $merge to move shadow docs into podio_items
-    // $unset _id to prevent conflict — podio_items will generate its own _id
-    const podioItemsCollectionName = PodioItem.collection.collectionName;
+    const appItemsCollectionName = AppItems.collection.collectionName;
+    logger.debug(
+      `[Reseed] ${appLabel}: merging shadow into ${appItemsCollectionName}...`,
+    );
     await shadowCollection
       .aggregate([
         { $unset: "_id" },
         {
           $merge: {
-            into: podioItemsCollectionName,
+            into: appItemsCollectionName,
             on: ["itemId", "appId"],
             whenMatched: "replace",
             whenNotMatched: "insert",
@@ -298,19 +380,25 @@ async function reseedApp(appId) {
       ])
       .toArray();
 
-    logger.info(`[Reseed] App ${appId}: shadow merged into ${podioItemsCollectionName}`);
+    logger.info(
+      `[Reseed] ${appLabel}: shadow merged into ${appItemsCollectionName}`,
+    );
 
-    // Hard-delete the soft-deleted old items (they're replaced now)
-    const mainCollection = mongoose.connection.collection(podioItemsCollectionName);
+    logger.debug(
+      `[Reseed] ${appLabel}: cleaning up old soft-deleted items...`,
+    );
+    const mainCollection = mongoose.connection.collection(
+      appItemsCollectionName,
+    );
     await mainCollection.deleteMany({
       appId: appIdNum,
       deleted: true,
       deletedAt: { $gte: swapStartTime },
     });
 
-    // Drop shadow collection
+    logger.debug(`[Reseed] ${appLabel}: dropping shadow collection...`);
     await shadowCollection.drop();
-    logger.info(`[Reseed] App ${appId}: shadow collection dropped`);
+    logger.info(`[Reseed] ${appLabel}: shadow collection dropped`);
 
     // ── Phase 4: Finalize ──────────────────────────────────────────────────
     await AppSchema.findOneAndUpdate(
@@ -323,33 +411,35 @@ async function reseedApp(appId) {
       },
     );
 
-    await PodioApp.findOneAndUpdate(
-      { appId: appIdNum },
-      { lastSeededAt: new Date() },
+    const totalElapsed = Math.round((Date.now() - fetchStartTime) / 1000);
+    logger.info(
+      `[Reseed] ${appLabel}: reseed completed successfully (${fetched} items in ${formatDuration(totalElapsed)})`,
     );
 
-    logger.info(`[Reseed] App ${appId}: reseed completed successfully (${fetched} items)`);
-    await releaseLock(lockKey);
+    if (lockAcquired) await releaseLock(lockKey);
+    return "success";
   } catch (err) {
     logger.error(`[Reseed] App ${appId} failed: ${err.message}`);
 
-    // ── Rollback ───────────────────────────────────────────────────────────
-    // Restore soft-deleted items (old data comes back)
     try {
-      const mainCollection = mongoose.connection.collection(PodioItem.collection.collectionName);
+      const mainCollection = mongoose.connection.collection(
+        AppItems.collection.collectionName,
+      );
       await mainCollection.updateMany(
         { appId: appIdNum, deleted: true, deletedAt: { $gte: swapStartTime } },
-        { $set: { deleted: false }, $unset: { deletedAt: "" } },
+        { $set: { deleted: false }, $unset: { deletedAt: 1 } },
       );
-      logger.info(`[Reseed] App ${appId}: old items restored from soft-delete`);
+      logger.info(`[Reseed] ${appLabel}: old items restored from soft-delete`);
     } catch (restoreErr) {
-      logger.error(`[Reseed] App ${appId}: restore failed: ${restoreErr.message}`);
+      logger.error(
+        `[Reseed] ${appLabel}: restore failed: ${restoreErr.message}`,
+      );
     }
 
-    // Don't drop shadow on failure — keep it for inspection/resume
-    logger.info(`[Reseed] App ${appId}: shadow collection preserved for resume/inspection`);
+    logger.info(
+      `[Reseed] ${appLabel}: shadow collection preserved for resume/inspection`,
+    );
 
-    // Mark as failed (but preserve progress for resume)
     await AppSchema.findOneAndUpdate(
       { appId: appIdNum },
       {
@@ -358,41 +448,47 @@ async function reseedApp(appId) {
       },
     );
 
-    await releaseLock(lockKey);
+    if (lockAcquired) await releaseLock(lockKey);
     throw err;
   }
 }
 
 /**
  * Clean up stale reseeds on startup.
- * If the server crashed during a reseed, the shadow collection is orphaned.
- * This restores old data and allows the reseed to be retried.
  */
 async function cleanupStaleReseeds() {
   try {
     const stale = await AppSchema.find({ reseedStatus: "in_progress" });
     for (const schema of stale) {
-      logger.warn(`[Reseed] Found stale in-progress reseed for app ${schema.appId}. Restoring data...`);
+      logger.warn(
+        `[Reseed] Found stale in-progress reseed for app ${schema.appId}. Restoring data...`,
+      );
 
-      // Restore any soft-deleted items from the interrupted reseed
-      const mainCollection = mongoose.connection.collection(PodioItem.collection.collectionName);
+      const mainCollection = mongoose.connection.collection(
+        AppItems.collection.collectionName,
+      );
       const restored = await mainCollection.updateMany(
         { appId: schema.appId, deleted: true },
-        { $set: { deleted: false }, $unset: { deletedAt: "" } },
+        { $set: { deleted: false }, $unset: { deletedAt: 1 } },
       );
       if (restored.modifiedCount > 0) {
-        logger.info(`[Reseed] App ${schema.appId}: restored ${restored.modifiedCount} soft-deleted items`);
+        logger.info(
+          `[Reseed] App ${schema.appId}: restored ${restored.modifiedCount} soft-deleted items`,
+        );
       }
 
-      // Release any stale Redis lock
-      await releaseLock(`reseed-lock-${schema.appId}`);
+      try {
+        await releaseLock(`reseed-lock-${schema.appId}`);
+      } catch (e) {
+        // Redis might not be available
+      }
 
-      // Mark as failed — shadow preserved for resume
       await AppSchema.findOneAndUpdate(
         { appId: schema.appId },
         {
           reseedStatus: "failed",
-          reseedError: "Server restarted during reseed. Old data restored. Shadow preserved for resume.",
+          reseedError:
+            "Server restarted during reseed. Old data restored. Shadow preserved for resume.",
         },
       );
     }
@@ -403,7 +499,6 @@ async function cleanupStaleReseeds() {
 
 /**
  * Create and return the secondary worker.
- * Handles app.update (schema diff + reseed) and app.delete (soft-delete all items).
  */
 function createSecondaryWorker() {
   const worker = new Worker(
@@ -414,7 +509,6 @@ function createSecondaryWorker() {
       if (type === "app.update") {
         logger.info(`[Secondary] Processing app.update for app ${appId}`);
 
-        // Fetch current schema from Podio
         let currentFields;
         try {
           const { data } = await podioClient.get(`/app/${appId}`);
@@ -422,31 +516,30 @@ function createSecondaryWorker() {
         } catch (err) {
           const status = err.response?.status;
           if (status && status >= 400 && status < 500) {
-            throw new UnrecoverableError(`Podio ${status} fetching app ${appId} schema`);
+            throw new UnrecoverableError(
+              `Podio ${status} fetching app ${appId} schema`,
+            );
           }
           throw err;
         }
 
-        // Compute hash
         const currentHash = crypto
           .createHash("md5")
           .update(JSON.stringify(currentFields))
           .digest("hex");
 
-        // Load stored snapshot
         const stored = await AppSchema.findOne({ appId: Number(appId) });
 
-        // Quick hash check
         if (stored?.fieldsHash === currentHash) {
           logger.info(`[Secondary] App ${appId} schema unchanged. Skipping.`);
           return;
         }
 
-        // Full diff
         const changes = diffSchemas(stored?.fields || [], currentFields);
-        logger.info(`[Secondary] App ${appId} schema changes: ${JSON.stringify(changes)}`);
+        logger.info(
+          `[Secondary] App ${appId} schema changes: ${JSON.stringify(changes)}`,
+        );
 
-        // Save new snapshot
         await AppSchema.findOneAndUpdate(
           { appId: Number(appId) },
           {
@@ -458,7 +551,6 @@ function createSecondaryWorker() {
           { upsert: true },
         );
 
-        // Check for structural changes
         const structuralTypes = [
           "field_added",
           "field_deleted",
@@ -466,46 +558,70 @@ function createSecondaryWorker() {
           "field_type_changed",
           "category_options_changed",
         ];
-        const structural = changes.filter((c) => structuralTypes.includes(c.type));
+        const structural = changes.filter((c) =>
+          structuralTypes.includes(c.type),
+        );
+        const triggeredReseed = structural.length > 0;
 
-        if (structural.length > 0) {
+        let reseedResult = null;
+        let reseedError = null;
+
+        if (triggeredReseed) {
           logger.info(
             `[Secondary] ${structural.length} structural changes detected for app ${appId}. Triggering reseed.`,
           );
-          await reseedApp(appId);
+          try {
+            await reseedApp(appId);
+            reseedResult = "success";
+          } catch (err) {
+            reseedResult = "failed";
+            reseedError = err.message;
+          }
         }
+
+        const appConfig = apps.find((a) => a.appId === Number(appId));
+        await AppSchemaLogs.create({
+          appId: Number(appId),
+          appName: appConfig?.name || null,
+          changes,
+          detectedAt: new Date(),
+          triggeredReseed,
+          reseedResult,
+          reseedError,
+          fieldsHashBefore: stored?.fieldsHash || null,
+          fieldsHashAfter: currentHash,
+        });
+
+        logger.info(`[Secondary] Schema change log saved for app ${appId}`);
       }
 
       if (type === "app.delete") {
         logger.info(`[Secondary] Processing app.delete for app ${appId}`);
 
-        // Soft-delete all items for this app
-        await PodioItem.delete({ appId: Number(appId) });
-
-        // Remove schema snapshot
+        await AppItems.delete({ appId: Number(appId) });
         await AppSchema.findOneAndDelete({ appId: Number(appId) });
 
-        // Deactivate the app in registry
-        await PodioApp.findOneAndUpdate(
-          { appId: Number(appId) },
-          { isActive: false },
+        logger.info(
+          `[Secondary] App ${appId}: all items soft-deleted, schema removed`,
         );
-
-        logger.info(`[Secondary] App ${appId}: all items soft-deleted, schema removed, app deactivated`);
       }
     },
-    { connection: createDuplicate(), concurrency: 1, lockDuration: 7_200_000 }, // 2hr — reseeds can be long
+    { connection: createDuplicate(), concurrency: 1, lockDuration: 7_200_000 },
   );
 
   worker.on("completed", (job) => {
-    logger.info(`[Secondary] Job completed: ${job?.data?.type} for app ${job?.data?.appId}`);
+    logger.info(
+      `[Secondary] Job completed: ${job?.data?.type} for app ${job?.data?.appId}`,
+    );
   });
 
   worker.on("failed", (job, err) => {
-    logger.error(`[Secondary] Job failed: ${job?.data?.type} for app ${job?.data?.appId}: ${err.message}`);
+    logger.error(
+      `[Secondary] Job failed: ${job?.data?.type} for app ${job?.data?.appId}: ${err.message}`,
+    );
   });
 
   return worker;
 }
 
-module.exports = { createSecondaryWorker, diffSchemas, reseedApp, cleanupStaleReseeds };
+module.exports = { createSecondaryWorker, reseedApp, cleanupStaleReseeds };

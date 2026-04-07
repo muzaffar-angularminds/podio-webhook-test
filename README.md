@@ -1,6 +1,6 @@
 # Podio Webhook Sync Service
 
-A Node.js service that receives webhooks from Podio CRM, queues item changes via BullMQ (Redis-backed), and syncs them to MongoDB using batch API calls. Built for high-throughput, rate-limit-safe data mirroring across multiple Podio apps.
+A Node.js service that mirrors Podio CRM data into MongoDB in near real-time. Podio sends webhook events when items change, the service queues them via BullMQ (Redis-backed), batches item IDs, fetches data from Podio's filter API, transforms it, and upserts to MongoDB. Built for high-throughput, rate-limit-safe data mirroring across multiple Podio apps.
 
 ## Architecture
 
@@ -30,7 +30,7 @@ Podio CRM
 |              +--------+---------+                |
 |                       |                          |
 |              +--------v---------+                |
-|              | Batch Worker     |                |
+|              | Primary Worker   |                |
 |              | POST /filter/    |                |
 |              | ?hook=false      |                |
 |              +--------+---------+                |
@@ -41,16 +41,13 @@ Podio CRM
 |              +--------+---------+                |
 |                       |                          |
 |  Multi-App Auth       |   Bull Board UI          |
-|  (token per app)      |   /admin/queues          |
-|                       |                          |
-|  App Registry         |   Admin UI               |
-|  (DB-stored creds)    |   /admin/apps            |
+|  (token per app)      |   /debug/queues          |
 +--------------------------------------------------+
                         |
                         v
                    MongoDB
-          podio_items, podio_apps,
-        app_schemas, webhook_state
+             app_items, app_schemas,
+          app_schema_logs, states
 ```
 
 ## How It Works
@@ -58,172 +55,176 @@ Podio CRM
 ### Webhook Flow
 
 1. Podio sends a webhook to `POST /webhooks/podio/:appId`
-2. The server immediately responds with `200 OK` (Podio requires fast ACK to avoid suspension)
-3. Based on the webhook type:
-   - **`hook.verify`** -- Calls Podio's `/hook/{id}/verify/validate` endpoint to activate the webhook
-   - **`item.create` / `item.update`** -- Enqueues the `item_id` into the staging Map (Set per app for O(1) dedup), schedules a delayed BullMQ flush trigger
-   - **`item.delete`** -- Soft deletes the item in MongoDB via mongoose-delete (sets `deleted: true`)
+2. Server responds `200 OK` immediately (Podio suspends webhooks after 15 failures)
+3. Based on webhook type:
+   - **`hook.verify`** -- Calls Podio's verify endpoint to activate the webhook
+   - **`item.create` / `item.update`** -- Enqueues item_id into staging Map (Set dedup), schedules delayed flush
+   - **`item.delete`** -- Soft deletes item in MongoDB (sets `deleted: true`)
    - **`app.update`** -- Enqueues to app-events queue for schema diff + potential reseed
-   - **`app.delete`** -- Enqueues to app-events queue to soft-delete all items and remove schema
+   - **`app.delete`** -- Enqueues to app-events queue to soft-delete all items
 
 ### Queue Processing (BullMQ + Redis)
 
-The `PodioQueueManager` uses BullMQ backed by Redis for durable job processing:
+- **Staging Map**: `Map<appId, Set<itemId>>` for O(1) dedup. Same item 100 times = stored once
+- **Flush Trigger**: 2-minute delayed BullMQ job. Timer resets on new webhooks -- user finishes editing before fetch
+- **Batch Worker**: Rate-limited at 240 calls/hr (under Podio's 250/hr ceiling). Uses `POST /item/app/{appId}/filter/?hook=false`
+- **`?hook=false`**: Prevents infinite webhook loops on all Podio read calls
+- **Error Handling**: 4xx = `UnrecoverableError` (no retry). 5xx = exponential backoff (2s, 4s, 8s)
+- **Crash Recovery**: Heartbeat persists staging Map to MongoDB every hour. BullMQ jobs survive restarts via Redis
 
-- **Staging Map**: In-memory `Map<appId, Set<itemId>>` for fast dedup. Same item enqueued 100 times = stored once
-- **Flush Trigger**: When an item is enqueued, a delayed BullMQ job is scheduled (2 min default). If more webhooks arrive for the same app, the timer resets -- ensuring the user finishes editing before data is fetched
-- **Batch Worker**: When the flush fires, it snapshots the Set, clears it, and pushes batch jobs to `podio-batches` queue. Rate-limited at 240 calls/hr (under Podio's 250/hr ceiling for the filter endpoint)
-- **`?hook=false`**: All Podio API read calls include this parameter to prevent infinite webhook loops
-- **Error Handling**:
-  - 4xx errors -- `UnrecoverableError`, skips all retries, moves to failed set in Bull Board
-  - 5xx/network errors -- BullMQ retries with exponential backoff (2s, 4s, 8s), max 3 attempts
-- **Crash Recovery**: Heartbeat persists staging Map to MongoDB every 10 min. On startup, `init()` restores pending items. BullMQ jobs in Redis survive process restarts independently
+### Data Storage -- Two-Layer Field Model
 
-### Multi-App Authentication
+Each item stores fields in two formats:
 
-App credentials (appId + appToken) are stored in MongoDB via the App Registry, not in env vars. This supports unlimited Podio apps.
+**`rawFields`** (Map) -- Full Podio field data keyed by `external_id`. Contains values, metadata, field type, label. Used as backup and for re-extraction.
 
-- `PodioAuthManager` maintains a token cache: `Map<appId, { accessToken, refreshToken, expiresAt }>`
-- Each app authenticates independently using its own `appToken` + shared `clientId`/`clientSecret` from env
-- Tokens auto-refresh 60 seconds before expiry
-- The Axios client auto-detects `appId` from the request URL and looks up credentials from DB (with in-memory cache)
+**`transformedFields`** (Map) -- Flat key:value pairs of only the fields the dashboard needs. Keys use underscores (e.g. `status_dont_touch`). Fast for queries and reads.
 
-### Data Transformation
-
-Raw Podio API responses are ~1500 lines per item. The transformer strips each field to:
-
-```json
+```js
+// rawFields — full metadata
 {
-  "field_id": 123456,
-  "external_id": "status-dont-touch",
-  "label": "Status",
-  "type": "category",
-  "values": [{ "value": { "text": "New Lead", "color": "DCEDC8" } }]
+  "status-dont-touch": {
+    values: [{ value: { id: 1, text: "New Lead", color: "D1F3EC" } }],
+    fieldId: 99838373,
+    label: "Status",
+    type: "category",
+    externalId: "status-dont-touch"
+  }
+}
+
+// transformedFields — flat key:value for dashboard
+{
+  status_dont_touch: "New Lead",
+  campaign: "DIRECT MAIL",
+  datetime_called_in: "2026-04-07 03:20:00",
+  icp_score: "5"
 }
 ```
 
-- Drops all `config` and `settings` bloat from each field
-- Trims `app` reference values to just `{ item_id, app_item_id, title }`
-- Extracts top-level metadata (`itemId`, `appId`, `title`, timestamps)
-- Works for any Podio app regardless of field structure
+Which fields appear in `transformedFields` is configured per app in `config/apps.js` via `extractFields`.
 
-### Schema Change Handling (Secondary Worker)
+### Multi-App Authentication
 
-When Podio fires an `app.update` webhook (someone changed the app's field structure):
+App credentials are stored in `config/apps.js` (static file). Each app authenticates independently.
 
-1. Secondary worker fetches `GET /app/{appId}` for current schema
-2. Computes MD5 hash and compares with stored `fieldsHash` in `app_schemas`
-3. If changed, runs `diffSchemas()` to detect: field added, deleted, renamed, type changed, category options changed
-4. Saves new schema snapshot (with previous version for reference)
-5. If structural changes detected, triggers a full reseed
+- `PodioAuthManager` maintains token cache: `Map<appId, { accessToken, refreshToken, expiresAt, appToken }>`
+- Shared `clientId`/`clientSecret` from `.env`, per-app `token` from config
+- Tokens auto-refresh 60s before expiry, fallback to full re-auth
+
+### Schema Change Detection (Secondary Worker)
+
+When `app.update` webhook fires:
+
+1. Fetches `GET /app/{appId}` for current field definitions
+2. Computes MD5 hash, compares with stored `fieldsHash`
+3. If changed, runs `diffSchemas()` -- detects: field added, deleted, renamed, type changed, category options changed
+4. Saves schema snapshot + logs change to `app_schema_logs`
+5. If structural changes detected, triggers full reseed
 
 ### Reseed -- Shadow Collection + Atomic Swap
 
-When a reseed is triggered (schema change or manual via seed script):
-
-1. **Fetch into shadow**: All items fetched via paginated filter API into `podio_items_staging_{appId}` -- old data in `podio_items` stays untouched
+1. **Fetch into shadow**: All items fetched into `podio_items_staging_{appId}`. Old data untouched.
 2. **Validate**: Compare shadow count with Podio's reported total
-3. **Swap**: Soft-delete old items -> copy shadow into `podio_items` -> hard-delete old soft-deleted items -> drop shadow
-4. **Rollback on failure**: If swap fails, restore soft-deleted items via `mongoose-delete` `.restore()`, drop shadow collection
-
-Dashboard reads from `podio_items` throughout -- no downtime during reseed.
+3. **Swap**: Soft-delete old items, `$merge` shadow into `app_items`, hard-delete old, drop shadow
+4. **Rollback on failure**: Restore soft-deleted items, preserve shadow for resume
+5. **Checkpoint resume**: Progress saved after every page. Resume from last checkpoint on restart.
 
 ## Project Structure
 
 ```
 src/
-+-- admin/
-|   +-- admin.controller.js  # App registry CRUD handlers
-|   +-- admin.route.js       # Admin API + page routes
-|   +-- views/
-|       +-- apps.html        # Admin UI for managing Podio apps
 +-- config/
-|   +-- config.js            # Env var validation (Joi) and export
+|   +-- apps.js              # App registry (appId, token, name, extractFields)
+|   +-- config.js            # Env var validation (Joi)
 |   +-- auth.js              # Multi-app OAuth token manager
-|   +-- redis.js             # ioredis client + idempotency helpers
-|   +-- logger.js            # Winston logger setup
+|   +-- redis.js             # ioredis client + lock helpers
+|   +-- logger.js            # Winston logger
 |   +-- morgan.js            # HTTP request logging
-+-- db/
-|   +-- podio-item.model.js  # Synced Podio items (soft delete enabled)
-|   +-- podio-app.model.js   # App registry (appId, appToken, isActive)
-|   +-- app-schema.model.js  # Schema snapshots for diffing + reseed tracking
-|   +-- webhook-state.model.js # Queue persistence for crash recovery
-|   +-- pluggins.js          # Mongoose plugins (paginate, private, softDelete)
-+-- middlewares/
-|   +-- error.js             # Error converter + handler
-|   +-- rateLimiter.js       # Rate limiting for auth routes
++-- models/
+|   +-- app-items.model.js   # Synced items (rawFields + transformedFields)
+|   +-- app-schema.model.js  # Schema snapshots + reseed tracking
+|   +-- app-schema-logs.model.js # Schema change audit trail
+|   +-- state.model.js       # Queue crash recovery
+|   +-- pluggins.js          # Mongoose plugins (paginate, softDelete)
 +-- queues/
 |   +-- index.js             # BullMQ queue definitions (4 queues)
-|   +-- secondaryWorker.js   # App event consumer, schema diff, reseed logic
+|   +-- queueManager.js      # Orchestrator: enqueue, flush scheduling, workers
+|   +-- primaryWorker.js     # Flush + Batch workers (Podio fetch + MongoDB upsert)
+|   +-- secondaryWorker.js   # App events, schema diff, reseed logic
 +-- scripts/
-|   +-- seedApp.js           # CLI seed script for initial bulk import
+|   +-- seedApp.js           # Seed single app (CLI)
+|   +-- seedAll.js           # Seed all apps sequentially
+|   +-- reExtract.js         # Rebuild transformedFields from rawFields (no API calls)
 +-- utils/
-|   +-- podioQueueManager.js # Queue orchestrator: flush, batch, secondary workers
-|   +-- transformPodioItem.js # Strips raw Podio response to clean fields
+|   +-- transformAppItem.js  # Raw Podio response -> rawFields + transformedFields
+|   +-- extractFieldValue.js # Generic Podio field value extractor
+|   +-- diffSchemas.js       # Schema comparison utility
 |   +-- apiError.js          # Custom API error class
 |   +-- catchAsync.js        # Async route handler wrapper
 +-- webhooks/
-|   +-- controller.js        # Webhook request handler (all event types)
+|   +-- controller.js        # Webhook handler (all event types)
 |   +-- service.js           # Podio webhook verification
-|   +-- client.js            # Axios instance with per-app auth + rate limit logging
+|   +-- client.js            # Axios instance with per-app auth
 |   +-- route.js             # POST /:appId route
-+-- app.js                   # Express app setup, middleware, Bull Board
-+-- index.js                 # Server entry point, DB/Redis connection, shutdown
++-- middlewares/
+|   +-- error.js             # Error converter + handler
+|   +-- rateLimiter.js       # Rate limiting
++-- app.js                   # Express app, middleware, Bull Board
++-- index.js                 # Entry point, connections, shutdown
 +-- route.js                 # Route index
 ```
 
 ## Database Collections
 
-### `podio_items` -- Synced Items
+### `app_items` -- Synced Items
 
 | Field | Type | Description |
 |---|---|---|
 | `itemId` | Number | Podio item ID (unique with appId) |
 | `appId` | Number | Podio app ID |
-| `data` | Mixed | Stripped fields array (field_id, external_id, label, type, values) |
-| `title` | String | Item title from Podio |
-| `podioLastUpdatedAt` | Date | Last event timestamp from Podio |
-| `syncStatus` | String | "success", "failed", or "pending" |
-| `lastSyncedAt` | Date | When this item was last synced |
-| `syncError` | String | Error message if sync failed |
-| `deleted` | Boolean | Soft delete flag (mongoose-delete) |
-| `deletedAt` | Date | When soft-deleted |
+| `appName` | String | App name from config |
+| `rawFields` | Map | Full field data keyed by external_id |
+| `transformedFields` | Map | Flat key:value of extracted fields (underscore keys) |
+| `appItemId` | Number | Per-app sequential ID |
+| `title` | String | Item title |
+| `createdOn` | Date | Podio creation date |
+| `lastEventOn` | Date | Last Podio event date |
+| `syncStatus` | String | success, failed, pending |
+| `lastSyncedAt` | Date | Last sync time |
+| `deleted` | Boolean | Soft delete flag |
 
-**Index**: Compound unique on `{ itemId, appId }`
-
-### `podio_apps` -- App Registry
-
-| Field | Type | Description |
-|---|---|---|
-| `appId` | Number | Podio app ID (unique) |
-| `appToken` | String | Per-app Podio credential |
-| `appName` | String | Human-readable name |
-| `spaceId` | Number | Podio workspace ID |
-| `isActive` | Boolean | Enable/disable syncing |
-| `webhookId` | Number | Podio webhook ID once registered |
-| `lastSeededAt` | Date | When last fully seeded |
+**Index**: Compound unique `{ itemId, appId }`
 
 ### `app_schemas` -- Schema Snapshots
 
 | Field | Type | Description |
 |---|---|---|
-| `appId` | Number | Podio app ID (unique) |
+| `appId` | Number | Unique |
 | `appName` | String | App name |
-| `fields` | Mixed | Current Podio field definitions |
-| `fieldsHash` | String | MD5 hash for quick change detection |
+| `fields` | Mixed | Current field definitions |
+| `fieldsHash` | String | MD5 for quick change detection |
 | `previousFields` | Mixed | Previous version for diffing |
-| `reseedStatus` | String | "idle", "in_progress", "completed", "failed" |
-| `reseedProgress` | Object | `{ current, total }` -- items fetched so far |
-| `reseedStartedAt` | Date | When reseed started |
-| `reseedError` | String | Error message if reseed failed |
+| `reseedStatus` | String | idle, in_progress, completed, failed |
+| `reseedProgress` | Object | `{ current, total }` |
 
-### `webhook_state` -- Queue Crash Recovery
+### `app_schema_logs` -- Schema Change Audit Trail
+
+| Field | Type | Description |
+|---|---|---|
+| `appId` | Number | Which app changed |
+| `changes` | Array | `[{ type, fieldId, externalId, label, from, to }]` |
+| `triggeredReseed` | Boolean | Did this change trigger a reseed |
+| `reseedResult` | String | success, failed, null |
+| `fieldsHashBefore` | String | Hash before change |
+| `fieldsHashAfter` | String | Hash after change |
+
+### `states` -- Queue Crash Recovery
 
 | Field | Type | Description |
 |---|---|---|
 | `appId` | String | Podio app ID |
-| `pendingItems` | Array | `[{ itemId, createdAt }]` -- items awaiting processing |
-| `lastSyncAt` | Date | Last heartbeat timestamp |
+| `pendingItems` | Array | `[{ itemId, createdAt }]` |
+| `lastSyncAt` | Date | Last heartbeat |
 
 ## Setup
 
@@ -231,7 +232,7 @@ src/
 
 - Node.js (v18+)
 - MongoDB
-- Redis (for BullMQ job queue)
+- Redis (for BullMQ)
 - Podio API credentials (client ID, client secret)
 
 ### Installation
@@ -244,6 +245,28 @@ cp .env.example .env
 # Edit .env with your credentials
 ```
 
+### Register Apps
+
+Add your Podio apps to `src/config/apps.js`:
+
+```js
+module.exports = [
+  {
+    appId: 13038875,
+    name: "Call Backs",
+    token: "your-app-token",
+    extractFields: [
+      "status-dont-touch",
+      "datetime-called-in",
+      "campaign",
+    ],
+  },
+];
+```
+
+- `appId` and `token`: from Podio App > Wrench icon > Developer
+- `extractFields`: which fields to include in `transformedFields` for the dashboard
+
 ### Environment Variables
 
 | Variable | Required | Description |
@@ -252,14 +275,13 @@ cp .env.example .env
 | `PORT` | Yes | Server port (default: 8080) |
 | `MONGODB_URL` | Yes | MongoDB connection string |
 | `PODIO_CLIENT_ID` | Yes | Podio OAuth client ID (shared across all apps) |
-| `PODIO_CLIENT_SECRET` | Yes | Podio OAuth client secret (shared across all apps) |
-| `PODIO_WEBHOOK_SECRET` | Yes | Podio webhook secret for verification |
-| `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`) |
-| `BATCH_SIZE` | No | Max items per filter API call (default: 500) |
-| `FLUSH_DELAY_MS` | No | Queue flush delay in ms (default: 120000 / 2 min) |
-| `SEED_DELAY_MS` | No | Delay between seed pages in ms (default: 15000 / 15s) |
-
-**Note:** Per-app credentials (`appId` + `appToken`) are stored in MongoDB via the Admin UI, not in env vars.
+| `PODIO_CLIENT_SECRET` | Yes | Podio OAuth client secret |
+| `PODIO_WEBHOOK_SECRET` | Yes | Podio webhook secret |
+| `REDIS_URL` | Yes | Redis connection URL |
+| `FLUSH_DELAY_MS` | No | Queue flush delay (default: 120000 / 2 min) |
+| `HEARTBEAT_INTERVAL_MS` | No | State persist interval (default: 3600000 / 1 hr) |
+| `BATCH_SIZE` | No | Items per filter API call (default: 500) |
+| `SEED_DELAY_MS` | No | Delay between seed pages (default: 18000 / 18s) |
 
 ### Running
 
@@ -267,109 +289,72 @@ cp .env.example .env
 # Start the server (development with auto-reload)
 npm run dev
 
-# The server starts on the configured PORT
-# Webhook endpoint:  POST /webhooks/podio/:appId
-# Health check:      GET /status
-# Admin UI:          http://localhost:8080/admin/apps
-# Queue Monitor:     http://localhost:8080/admin/queues
+# Server endpoints:
+# Webhook:      POST /webhooks/podio/:appId
+# Health check: GET /status
+# Queue UI:     http://localhost:8080/debug/queues
 ```
 
-### Registering Podio Apps
+## Seeding
 
-Before the service can process webhooks for a Podio app, you must register it:
-
-1. Open the Admin UI at `http://localhost:8080/admin/apps`
-2. Fill in the app's ID, token, name, and space ID
-3. Click "Register App"
-4. The app appears in the table with Active status
-
-You can deactivate/reactivate or delete apps from the same page.
-
-### Running the Seed Script
-
-The seed script bulk-fetches all items from a Podio app into MongoDB. Use it for:
-- Initial data import when connecting a new app
-- Manual reseed if data gets out of sync
+### Seed a Single App
 
 ```bash
-# Seed a specific app (must be registered and active in the Admin UI first)
-npm run seed -- --app_id=30682880
+npm run seed -- --app_id=13038875
+npm run seed -- --app_id=13038875 --force              # Force reseed
+npm run seed -- --app_id=13038875 --resume              # Resume interrupted
+npm run seed -- --app_id=13038875 --from=2026-01-01 --to=2026-04-07  # Date range
+npm run seed -- --app_id=13038875 --batch_size=200      # Smaller batches
 ```
 
-**What it does:**
-1. Connects to MongoDB
-2. Looks up the app in the registry (must be registered and active)
-3. Fetches all items via paginated `POST /item/app/{appId}/filter/?hook=false`
-4. Sleeps `SEED_DELAY_MS` (default 15s) between pages to respect Podio's 250/hr rate limit
-5. Uses the shadow collection approach: fetches into `podio_items_staging_{appId}`, then swaps atomically
-6. If the seed fails midway, old data is restored from soft-delete -- no data loss
-7. Updates `lastSeededAt` on the app registry entry
-8. Logs progress: `Page X/Y, N items fetched`
+### Seed All Apps
 
-**Rate limit note:** The seed script shares the 250/hr filter API budget with the real-time batch worker. Run seeds during low webhook volume periods, or when the server is not running.
+```bash
+npm run seed:all
+npm run seed:all -- --force
+npm run seed:all -- --from=2026-01-01 --to=2026-04-07 --batch_size=200
+```
 
-## API Endpoints
+Runs apps sequentially (shared rate limit). Each app's data is written to `app_items` as soon as that app finishes -- no waiting for all apps.
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/webhooks/podio/:appId` | Receive Podio webhooks for a specific app |
-| `GET` | `/status` | Health check (returns 200) |
-| `GET` | `/admin/apps` | Admin UI -- manage registered Podio apps |
-| `GET` | `/admin/queues` | Bull Board -- inspect BullMQ job queues |
-| `GET` | `/admin/api/apps` | List all registered apps (JSON) |
-| `POST` | `/admin/api/apps` | Register a new app |
-| `PATCH` | `/admin/api/apps/:appId/toggle` | Toggle app active/inactive |
-| `DELETE` | `/admin/api/apps/:appId` | Remove an app |
+### Re-Extract (No API Calls)
 
-### Webhook Payload (from Podio)
+When you add/remove fields in `extractFields`, rebuild `transformedFields` from existing `rawFields`:
+
+```bash
+npm run re-extract -- --app_id=13038875    # Single app
+npm run re-extract -- --all                # All apps
+```
+
+Pure DB operation -- no Podio API calls, runs in seconds.
+
+## Rate Limiting
+
+| Operation | Endpoint | Budget | Our limit |
+|---|---|---|---|
+| Real-time sync | POST /filter/ | 250/hr | 240/hr (BullMQ limiter) |
+| Seeding | POST /filter/ | 250/hr (shared) | 200/hr (18s delay) |
+| Schema fetch | GET /app/{id} | 1,000/hr | On-demand |
+
+Rate limit 420 responses: pause 60s and retry (doesn't count as failed attempt).
+
+## Health Check
+
+`GET /status` returns:
 
 ```json
-{
-  "type": "item.create",
-  "hook_id": 24360216,
-  "item_id": 3276908608,
-  "code": "verification_code"
-}
+{ "status": "ok", "mongo": "connected", "redis": "connected" }
 ```
 
-The `app_id` comes from the URL parameter (`:appId`), not the request body.
-
-### Supported Webhook Types
-
-| Type | Action |
-|---|---|
-| `hook.verify` | Calls Podio verify API to activate webhook |
-| `item.create` | Enqueues item for batch fetch + upsert |
-| `item.update` | Enqueues item for batch fetch + upsert |
-| `item.delete` | Soft deletes item in MongoDB |
-| `app.update` | Triggers schema diff, reseeds if structural changes |
-| `app.delete` | Soft deletes all items, removes schema, deactivates app |
-
-## Middleware Stack
-
-1. Bull Board UI at `/admin/queues`
-2. Empty favicon handler (prevents 404 noise)
-3. Morgan HTTP logging (disabled in test)
-4. Helmet security headers (inline scripts allowed for admin pages)
-5. JSON and URL-encoded body parsing
-6. Gzip compression
-7. CORS (localhost/LAN in dev, all origins in prod)
-8. Cookie parser
-9. Rate limiter on `/auth` routes (production only)
-10. Application routes
-11. 404 handler
-12. Error converter + handler
+Returns `503` with `"status": "degraded"` if MongoDB or Redis is disconnected.
 
 ## Graceful Shutdown
 
-On `SIGTERM`, `SIGINT`, uncaught exceptions, or unhandled rejections:
+On `SIGTERM`, `SIGINT`, or uncaught errors:
 
-1. Close all BullMQ workers (flush, batch, secondary) -- finish current jobs
-2. Persist staging Map to MongoDB (pending items saved)
-3. Close Redis connection
-4. Disconnect from MongoDB
-5. Exit process
+1. Close all BullMQ workers (finish current jobs)
+2. Persist staging Map to MongoDB
+3. Close Redis and MongoDB connections
+4. Exit
 
-Double-shutdown guard prevents duplicate shutdown sequences.
-
-On next startup, `queueManager.init()` recovers pending items from MongoDB and re-enqueues them. BullMQ jobs in Redis are restored independently.
+Double-shutdown guard prevents duplicate sequences.

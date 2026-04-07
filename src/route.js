@@ -3,16 +3,11 @@ const router = express.Router();
 const config = require("./config/config");
 
 const webhookRoute = require("./webhooks/route");
-const adminRoute = require("./admin/admin.route");
 
 const defaultRoutes = [
   {
     path: "/webhooks/podio",
     route: webhookRoute,
-  },
-  {
-    path: "/admin",
-    route: adminRoute,
   },
 ];
 

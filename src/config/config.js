@@ -12,6 +12,10 @@ const envVarsSchema = Joi.object({
   PODIO_CLIENT_SECRET: Joi.string().required(),
   PODIO_WEBHOOK_SECRET: Joi.string().required(),
   REDIS_URL: Joi.string().default("redis://localhost:6379"),
+  FLUSH_DELAY_MS: Joi.number().default(120000),
+  HEARTBEAT_INTERVAL_MS: Joi.number().default(3600000),
+  BATCH_SIZE: Joi.number().default(500),
+  SEED_DELAY_MS: Joi.number().default(18000),
 }).unknown();
 
 const { value: envVars, error } = envVarsSchema.validate(process.env, {
@@ -30,4 +34,8 @@ module.exports = {
   PODIO_CLIENT_SECRET: envVars.PODIO_CLIENT_SECRET,
   PODIO_WEBHOOK_SECRET: envVars.PODIO_WEBHOOK_SECRET,
   REDIS_URL: envVars.REDIS_URL,
+  FLUSH_DELAY_MS: envVars.FLUSH_DELAY_MS,
+  HEARTBEAT_INTERVAL_MS: envVars.HEARTBEAT_INTERVAL_MS,
+  BATCH_SIZE: envVars.BATCH_SIZE,
+  SEED_DELAY_MS: envVars.SEED_DELAY_MS,
 };

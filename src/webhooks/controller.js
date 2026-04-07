@@ -1,27 +1,18 @@
 const catchAsync = require("../utils/catchAsync");
 const { verifyWebhook } = require("./service");
-const queueManager = require("../utils/podioQueueManager");
-const PodioItem = require("../db/podio-item.model");
-const PodioApp = require("../db/podio-app.model");
+const queueManager = require("../queues/queueManager");
+const AppItems = require("../models/app-items.model");
+const apps = require("../config/apps");
 const { appQueue } = require("../queues");
 const logger = require("../config/logger");
 
 const isValidId = (id) => /^\d+$/.test(String(id));
 
-// Cache active appIds to avoid DB lookup on every webhook
-const activeAppCache = new Set();
-let cacheLoadedAt = 0;
-const CACHE_TTL = 60_000; // 1 minute
+// Build a Set of registered appIds from config for O(1) lookup
+const registeredAppIds = new Set(apps.map((a) => a.appId));
 
-async function isAppActive(appId) {
-  // Refresh cache if stale
-  if (Date.now() - cacheLoadedAt > CACHE_TTL) {
-    const apps = await PodioApp.find({ isActive: true }, { appId: 1 });
-    activeAppCache.clear();
-    apps.forEach((a) => activeAppCache.add(a.appId));
-    cacheLoadedAt = Date.now();
-  }
-  return activeAppCache.has(Number(appId));
+function isAppRegistered(appId) {
+  return registeredAppIds.has(Number(appId));
 }
 
 const handleWebhook = catchAsync(async (req, res) => {
@@ -34,7 +25,6 @@ const handleWebhook = catchAsync(async (req, res) => {
     return;
   }
 
-  // All processing after 200 is fire-and-forget — errors must not crash Express
   try {
     switch (type) {
       case "hook.verify": {
@@ -44,8 +34,8 @@ const handleWebhook = catchAsync(async (req, res) => {
 
       case "item.create":
       case "item.update": {
-        if (!(await isAppActive(app_id))) {
-          logger.warn(`[Webhook] ${type} for unregistered/inactive app ${app_id}, ignoring`);
+        if (!isAppRegistered(app_id)) {
+          logger.warn(`[Webhook] ${type} for unregistered app ${app_id}, ignoring`);
           break;
         }
         await queueManager.enqueue(app_id, item_id);
@@ -56,7 +46,7 @@ const handleWebhook = catchAsync(async (req, res) => {
       }
 
       case "item.delete": {
-        await PodioItem.delete({ itemId: Number(item_id), appId: Number(app_id) });
+        await AppItems.delete({ itemId: Number(item_id), appId: Number(app_id) });
         logger.info(
           `[Webhook] item.delete soft-deleted: app=${app_id} item=${item_id}`,
         );

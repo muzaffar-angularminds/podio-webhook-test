@@ -3,7 +3,7 @@ const app = require("./app");
 const config = require("./config/config");
 const logger = require("./config/logger");
 const { redis } = require("./config/redis");
-const queueManager = require("./utils/podioQueueManager");
+const queueManager = require("./queues/queueManager");
 const { cleanupStaleReseeds } = require("./queues/secondaryWorker");
 
 let server;
@@ -28,35 +28,26 @@ async function connectWithRetry(attempt = 1) {
 }
 
 connectWithRetry().then(async () => {
-
-  // Check for stale reseeds from previous crashes
   await cleanupStaleReseeds();
-
-  // Recover any pending queue items from DB
   await queueManager.init();
-
-  // Start BullMQ workers (flush + batch + secondary)
   queueManager.startWorkers();
 
   server = app.listen(config.PORT, () => {
     logger.info(`Node server listening on port => ${config.PORT}`);
-    logger.info(
-      `Bull Board UI => http://localhost:${config.PORT}/admin/queues`,
-    );
-    logger.info(
-      `App Registry => http://localhost:${config.PORT}/admin/apps`,
-    );
+    logger.info(`Bull Board UI => http://localhost:${config.PORT}/debug/queues`);
   });
+}).catch((err) => {
+  logger.error(`[Startup] Fatal error during initialization: ${err.message}`);
+  process.exit(1);
 });
 
-// Graceful shutdown: close workers → close server → disconnect Redis + MongoDB → exit
+// Graceful shutdown
 let isShuttingDown = false;
 const gracefulShutdown = async (signal) => {
   if (isShuttingDown) return;
   isShuttingDown = true;
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
-  // Close BullMQ workers and persist staging Map
   try {
     await queueManager.shutdown();
   } catch (err) {

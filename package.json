@@ -5,7 +5,9 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "cross-env NODE_ENV=development nodemon src/index.js",
-    "seed": "node src/scripts/seedApp.js"
+    "seed": "node src/scripts/seedApp.js",
+    "seed:all": "node src/scripts/seedAll.js",
+    "re-extract": "node src/scripts/reExtract.js"
   },
   "keywords": [],
   "author": "",
